@@ -48,38 +48,28 @@ const { World, Player, Box, MovingPlatform } = window.Engine;
    CONFIG
    =========================================================================== */
 const CFG = {
-  // 45Hz sim: a third less CPU than 60 for physics that is not twitch-precise.
-  // Only the host uses this, so it can change without desyncing anyone.
-  SIM_HZ:           45,
-  // Broadcast every tick the host computes. With no client-side prediction,
-  // snapshot rate is the only lever left for responsiveness, so there is no
-  // reason to send less often than the host has new state — SNAPSHOT_HZ
-  // is pinned to SIM_HZ below rather than given its own number.
-  SNAPSHOT_HZ:      45,
+  SIM_HZ:           60,     // up from 45 — you confirmed no lag, so spend the headroom on precision
+  SNAPSHOT_HZ:      60,     // stays pinned to SIM_HZ
+
   MAX_PLAYERS:      8,
 
-  MAX_CATCHUP_MS:   200,    // clamp frame delta; no post-stall spiral
-  MAX_STEPS_FRAME:  4,      // never let one frame run away
+  MAX_CATCHUP_MS:   200,
+  MAX_STEPS_FRAME:  4,
 
-  // Interpolation: render everything (including the local player) this far
-  // behind, so there are always two real snapshots to blend between and we
-  // never have to guess forward. At 45Hz snapshots two intervals is ~44ms;
-  // a little slack is kept for network jitter.
-  INTERP_DELAY_MS:  55,
-  SNAP_BUFFER:      16,
+  INTERP_DELAY_MIN: 34,     // ~2 snapshot intervals at 60Hz (was 44 at 45Hz)
+  INTERP_DELAY_MAX: 200,    // slightly tighter ceiling now the floor is lower
+  INTERP_DELAY_START: 45,
+  JITTER_EWMA:      0.12,
+  JITTER_MARGIN:    3.0,
+  SNAP_BUFFER:      28,     // a bit more headroom since snapshots arrive more often
 
-  // If two consecutive snapshots for the same entity differ by more than
-  // this, treat it as a teleport/respawn rather than a slide: jump straight
-  // to the newer position instead of interpolating across the whole level.
   TELEPORT_DIST:    140,
 
-  // Session
-  HOST_TIMEOUT_MS:  2500,   // no snapshot this long => host is gone
-  INPUT_KEEPALIVE_MS: 100,  // resend held input at least this often
+  HOST_TIMEOUT_MS:  2500,
+  INPUT_KEEPALIVE_MS: 80,   // was 100 — matches the faster tick, held-key latency shaves a touch
 
-  // Security
   MAX_MSG_BYTES:    2048,
-  MAX_MSG_PER_SEC:  90,
+  MAX_MSG_PER_SEC:  110,    // was 90 — 60Hz keepalive traffic needs a bit more headroom
 };
 const SIM_DT  = 1 / CFG.SIM_HZ;
 const SIM_MS  = 1000 / CFG.SIM_HZ;
@@ -252,6 +242,45 @@ function dropPlayer(nw, slot) {
    perfect connection. So we keep the previous and current sim state and let
    the renderer blend between them.
    =========================================================================== */
+/* ===========================================================================
+   JITTER TRACKER
+   ---------------------------------------------------------------------------
+   A fixed interpolation delay is a guess about network conditions that
+   quickly stops matching reality — too short and the client keeps running
+   out of buffered snapshots (visible as micro-freezes while it holds the
+   last position), too long and every remote entity lags more than the
+   connection actually requires.
+
+   This tracks the mean and variability of the gap between arriving
+   snapshots using exponential moving averages (cheap, O(1) per sample, no
+   history array to scan), and derives a delay that sits comfortably above
+   what jitter is actually being observed. It only ever grows or shrinks
+   gradually, so the render timeline never jumps.
+   =========================================================================== */
+class JitterTracker {
+  constructor() {
+    this.meanGap = 1000 / CFG.SNAPSHOT_HZ;
+    this.meanDev = 0;                 // mean absolute deviation from meanGap
+    this.delay = CFG.INTERP_DELAY_START;
+    this._lastAt = 0;
+  }
+
+  sample(recvAt) {
+    if (this._lastAt) {
+      const gap = recvAt - this._lastAt;
+      const a = CFG.JITTER_EWMA;
+      this.meanGap += (gap - this.meanGap) * a;
+      this.meanDev += (Math.abs(gap - this.meanGap) - this.meanDev) * a;
+      const target = this.meanGap * 2 + this.meanDev * CFG.JITTER_MARGIN;
+      const clamped = Math.max(CFG.INTERP_DELAY_MIN, Math.min(CFG.INTERP_DELAY_MAX, target));
+      // Ease toward the new target rather than jumping — a sudden delay
+      // change is itself a visible hitch, which defeats the point.
+      this.delay += (clamped - this.delay) * 0.15;
+    }
+    this._lastAt = recvAt;
+  }
+}
+
 class Tween {
   constructor() { this.prev = new Map(); this.curr = new Map(); this._out = []; }
   before(world) {
@@ -496,9 +525,10 @@ const Host = {
 const Client = {
   nw: null, conn: null, mySlot: -1,
   buf: [], seq: 0, last: 0, alive: false,
+  jitter: null, _lastTick: -1,
   _sentMask: -1, _sentAt: 0,
   _out: [],
-  stats: { gap: 0, lastRecv: 0, snaps: 0, teleports: 0 },
+  stats: { gap: 0, lastRecv: 0, snaps: 0, teleports: 0, outOfOrder: 0 },
 
   start(conn, input, onStatus, onEnd) {
     this.nw = buildWorld();
@@ -511,6 +541,8 @@ const Client = {
     this._sentMask = -1; this._sentAt = 0;
     this.alive = true;
     this.last = performance.now();
+    this.jitter = new JitterTracker();
+    this._lastTick = -1;      // guards against an out-of-order (stale) snapshot
 
     // Nothing on the client simulates, so nothing needs to be dynamic —
     // every entity here is a positioned prop, not a physics body.
@@ -534,10 +566,18 @@ const Client = {
     const snap = Codec.decode(msg);
     if (!snap) return;
 
+    // The connection is unreliable+unordered, so a delayed packet can
+    // arrive after a newer one already has. Using it would rubber-band the
+    // world backward for one frame, so anything at or behind the last
+    // accepted tick is dropped — not buffered, not blended, just discarded.
+    if (snap.tick <= this._lastTick) { this.stats.outOfOrder++; return; }
+    this._lastTick = snap.tick;
+
     const now = performance.now();
     this.stats.gap = this.stats.lastRecv ? now - this.stats.lastRecv : 0;
     this.stats.lastRecv = now;
     this.stats.snaps++;
+    this.jitter.sample(now);
 
     // Timeline uses LOCAL receive time — the two machines' clocks are not
     // synchronized and never will be.
@@ -556,7 +596,7 @@ const Client = {
   interpolate() {
     const buf = this.buf;
     if (!buf.length) return null;
-    const at = performance.now() - CFG.INTERP_DELAY_MS;
+    const at = performance.now() - this.jitter.delay;
 
     let older = buf[0], newer = null;
     for (let i = buf.length - 1; i >= 0; i--) {
@@ -660,7 +700,7 @@ const Client = {
 
 window.Netcode = {
   CFG, BTN, INPUT_MASK, P_FLAG, B_FLAG,
-  Codec, Validate, Host, Client, Tween,
+  Codec, Validate, Host, Client, Tween, JitterTracker,
   buildWorld, makePlayer, dropPlayer, stateToMask, maskToState, PALETTE,
 };
 
