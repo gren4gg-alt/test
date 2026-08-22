@@ -76,34 +76,47 @@ const { World, Player, Box, MovingPlatform } = window.Engine;
   MAX_MSG_PER_SEC:  90,
 };*/
 const CFG = {
-  // Physics
-  SIM_HZ:           50,
+  // ─────────────────────────────────────────────
+  // SIMULATION
+  // ─────────────────────────────────────────────
+  SIM_HZ:           60,
 
-  // Network
-  SNAPSHOT_HZ:      25,
+  // ─────────────────────────────────────────────
+  // NETWORK
+  // ─────────────────────────────────────────────
+  SNAPSHOT_HZ:      30,
+  MAX_PLAYERS:      8,
 
-  // Remote-player interpolation
+  // ─────────────────────────────────────────────
+  // REMOTE ENTITY INTERPOLATION
+  // ─────────────────────────────────────────────
   INTERP_DELAY_MS:  70,
   SNAP_BUFFER:      8,
 
-  // Local-player correction
-  PULL:             0.15,
-  PULL_VEL:         0.20,
+  // ─────────────────────────────────────────────
+  // LOCAL PLAYER AUTHORITY CORRECTION
+  // ─────────────────────────────────────────────
+  PULL:             0.12,
+  PULL_VEL:         0.18,
   SNAP_DIST:        90,
 
-  // Frame protection
+  // ─────────────────────────────────────────────
+  // FRAME / CPU PROTECTION
+  // ─────────────────────────────────────────────
   MAX_CATCHUP_MS:   150,
   MAX_STEPS_FRAME:  3,
 
-  // Session
+  // ─────────────────────────────────────────────
+  // CONNECTION
+  // ─────────────────────────────────────────────
   HOST_TIMEOUT_MS:  2500,
   INPUT_KEEPALIVE_MS: 80,
 
-  // Security
+  // ─────────────────────────────────────────────
+  // SECURITY / FLOOD PROTECTION
+  // ─────────────────────────────────────────────
   MAX_MSG_BYTES:    2048,
   MAX_MSG_PER_SEC:  60,
-
-  MAX_PLAYERS:      8,
 };
 const SIM_DT  = 1 / CFG.SIM_HZ;
 const SIM_MS  = 1000 / CFG.SIM_HZ;
