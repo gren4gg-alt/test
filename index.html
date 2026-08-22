@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Duble Trouble — Networked</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#14141c; color:#e6e6f0;
+               font-family: system-ui, -apple-system, sans-serif;
+               -webkit-user-select:none; user-select:none; }
+
+  #lobby { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+           justify-content:center; gap:14px; padding:24px; z-index:20; background:#14141c; }
+  #lobby h1 { margin:0; font-size:22px; font-weight:600; letter-spacing:.5px; }
+  .btns { display:flex; gap:10px; }
+  button, input { font:inherit; padding:11px 18px; border-radius:8px; border:1px solid #3a3a4c;
+                  background:#242430; color:#e6e6f0; }
+  button { cursor:pointer; min-width:120px; }
+  button:active { background:#32324a; }
+  #joinRow { display:none; gap:8px; }
+  #joinRow.on { display:flex; }
+  #joinInput { width:220px; }
+  #code { font:600 18px ui-monospace, monospace; color:#7ee0d0; background:#1c1c26;
+          padding:10px 14px; border-radius:8px; user-select:all; word-break:break-all;
+          max-width:90vw; text-align:center; }
+  #status { font-size:13px; color:#8a8aa0; min-height:1.2em; text-align:center; }
+
+  #stage { position:fixed; inset:0; display:none; }
+  #stage.on { display:block; }
+  canvas { display:block; width:100%; height:100%; touch-action:none; }
+  #hud { position:fixed; top:6px; left:8px; font:11px ui-monospace, monospace;
+         color:#6a6a80; pointer-events:none; z-index:5; }
+
+  /* Touch controls — only on coarse-pointer devices, per the existing
+     input.js convention. Desktop never sees them. */
+  #touch { display:none; position:fixed; inset:auto 0 0 0; z-index:10;
+           padding:0 18px 22px; justify-content:space-between; pointer-events:none; }
+  @media (pointer: coarse) { #touch { display:flex; } }
+  .pad { display:flex; gap:12px; pointer-events:auto; }
+  .tbtn { width:66px; height:66px; border-radius:50%; border:1px solid #45455e;
+          background:rgba(40,40,58,.72); color:#d8d8ea; font-size:20px;
+          display:flex; align-items:center; justify-content:center;
+          backdrop-filter: blur(3px); }
+  .tbtn.pressed { background:rgba(90,90,130,.9); }
+
+  /* Landscape hint — shared-screen co-op needs the width. */
+  #rotate { position:fixed; inset:0; z-index:40; display:none;
+            flex-direction:column; align-items:center; justify-content:center;
+            gap:14px; background:#14141c; text-align:center; padding:24px; }
+  #rotate span { font-size:44px; }
+  @media (pointer: coarse) and (orientation: portrait) { #rotate { display:flex; } }
+</style>
+</head>
+<body>
+
+<div id="rotate">
+  <span>&#8635;</span>
+  <div>Rotate your device to landscape</div>
+  <div style="font-size:13px;color:#8a8aa0">This is shared-screen co-op &mdash; it needs the width.</div>
+</div>
+
+<div id="lobby">
+  <h1>Duble Trouble</h1>
+  <div class="btns">
+    <button id="hostBtn">Host</button>
+    <button id="joinBtn">Join</button>
+  </div>
+  <div id="joinRow">
+    <input id="joinInput" placeholder="Room code" maxlength="64" autocomplete="off" spellcheck="false">
+    <button id="joinGo">Go</button>
+  </div>
+  <div id="code" hidden></div>
+  <div id="status"></div>
+</div>
+
+<div id="stage">
+  <canvas id="game"></canvas>
+</div>
+<div id="hud"></div>
+
+<div id="touch">
+  <div class="pad">
+    <div class="tbtn" id="btnLeft">&#9664;</div>
+    <div class="tbtn" id="btnRight">&#9654;</div>
+  </div>
+  <div class="pad">
+    <div class="tbtn" id="btnAction">&#9995;</div>
+    <div class="tbtn" id="btnJump">&#9650;</div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="engine.js"></script>
+<script src="input.js"></script>
+<script src="level.js"></script>
+<script src="netcode.js"></script>
+<script>
+"use strict";
+(function () {
+
+const { Host, Client, Validate, CFG } = window.Netcode;
+const { MovingPlatform, Box, Player, WindZone } = window.Engine;
+
+const $ = id => document.getElementById(id);
+const lobby = $('lobby'), stage = $('stage'), statusEl = $('status'),
+      codeEl = $('code'), hudEl = $('hud'), canvas = $('game');
+const ctx = canvas.getContext('2d');
+
+const setStatus = m => { statusEl.textContent = m; };
+
+// --- input ---
+const input = new window.InputManager();
+window.bindTouchButton($('btnLeft'),   input, 'left');
+window.bindTouchButton($('btnRight'),  input, 'right');
+window.bindTouchButton($('btnJump'),   input, 'jump');
+window.bindTouchButton($('btnAction'), input, 'action');
+
+let side = null, peer = null, running = false;
+
+/* ---------- canvas sizing: letterbox the fixed-size level ---------- */
+let scale = 1, offX = 0, offY = 0;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cw = window.innerWidth, ch = window.innerHeight;
+  canvas.width = cw * dpr; canvas.height = ch * dpr;
+  scale = Math.min(cw / window.Level.WIDTH, ch / window.Level.HEIGHT);
+  offX = (cw - window.Level.WIDTH * scale) / 2;
+  offY = (ch - window.Level.HEIGHT * scale) / 2;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 100));
+
+/* ---------- render ---------- */
+function draw() {
+  const W = window.Level.WIDTH, H = window.Level.HEIGHT;
+  ctx.save();
+  ctx.setTransform(canvas.width / window.innerWidth, 0, 0,
+                   canvas.height / window.innerHeight, 0, 0);
+  ctx.fillStyle = '#14141c';
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+  ctx.translate(offX, offY);
+  ctx.scale(scale, scale);
+
+  ctx.fillStyle = '#191922';
+  ctx.fillRect(0, 0, W, H);
+
+  // Interpolated draw list: prev/curr sim states blended by alpha, so the
+  // visuals are smooth regardless of whether the display runs at 30, 60 or
+  // 120Hz. Never read entity.x/y directly here — that reintroduces the
+  // stutter this exists to remove.
+  const list = side.renderList();
+
+  // Wind zones first (translucent, behind everything).
+  for (let i = 0; i < list.length; i++) {
+    const e = list[i].entity;
+    if (!e.isWindZone) continue;
+    ctx.fillStyle = e.color;
+    ctx.fillRect(list[i].x, list[i].y, e.w, e.h);
+  }
+
+  const me = mySlot();
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i], e = it.entity;
+    if (e.isWindZone) continue;
+    const x = it.x, y = it.y;
+
+    ctx.fillStyle = e.color;
+    ctx.fillRect(x, y, e.w, e.h);
+
+    if (e instanceof Player) {
+      // facing pip, so you can see which way a throw will go
+      ctx.fillStyle = 'rgba(0,0,0,.55)';
+      const px = e.facing > 0 ? x + e.w - 9 : x + 4;
+      ctx.fillRect(px, y + 9, 5, 5);
+      if (e._slot === me) {
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+        ctx.strokeRect(x - 1, y - 1, e.w + 2, e.h + 2);
+      }
+    }
+    if (e instanceof Box && e.carried) {
+      ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1.5;
+      ctx.strokeRect(x + 1, y + 1, e.w - 2, e.h - 2);
+    }
+  }
+  ctx.restore();
+}
+
+function pct(a,b){ return (a+b)?Math.round(100*a/(a+b)):0; }
+function mySlot() { return side === Host ? Host.mySlot : Client.mySlot; }
+
+function hud() {
+  if (side === Host) {
+    hudEl.textContent =
+      `HOST players:${Host.nw.players.size}  tick:${Host.tick}  ` +
+      `steps/frame:${Host.stats.stepsFrame}  sim:${Host.stats.simMs.toFixed(1)}ms  ` +
+      `${CFG.SIM_HZ}Hz sim / ${CFG.SNAPSHOT_HZ}Hz net`;
+  } else {
+    const s = Client.stats;
+    const stale = s.lastRecv ? Math.round(performance.now() - s.lastRecv) : 0;
+    hudEl.textContent =
+      `CLIENT slot:${Client.mySlot}  gap:${Math.round(s.gap)}ms  since:${stale}ms  ` +
+      `replay:${s.replays}t  sim:${s.simMs.toFixed(1)}ms  ` +
+      `skipped:${pct(s.accepted, s.rollbacks)}%  budget-hits:${s.budgetHits}`;
+  }
+}
+
+function frame(now) {
+  if (!running) return;
+  side.update(now);
+  draw();
+  hud();
+  requestAnimationFrame(frame);
+}
+
+function begin(which) {
+  side = which;
+  lobby.style.display = 'none';
+  stage.classList.add('on');
+  resize();
+  running = true;
+  requestAnimationFrame(frame);
+}
+
+/* ---------- host ---------- */
+$('hostBtn').onclick = () => {
+  $('hostBtn').disabled = $('joinBtn').disabled = true;
+  setStatus('Creating room…');
+  peer = new Peer({ debug: 1 });
+  peer.on('open', id => {
+    Host.start(peer, input, setStatus);
+    codeEl.hidden = false;
+    codeEl.textContent = id;
+    setStatus('Share this code, then press anything to play.');
+    setTimeout(() => begin(Host), 400);
+  });
+  peer.on('error', e => setStatus('Peer error: ' + e.type));
+};
+
+/* ---------- join ---------- */
+$('joinBtn').onclick = () => { $('joinRow').classList.add('on'); $('joinInput').focus(); };
+$('joinInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('joinGo').click(); });
+$('joinGo').onclick = () => {
+  const raw = $('joinInput').value.trim();
+  if (!Validate.roomCode(raw)) { setStatus("That room code doesn't look valid."); return; }
+  $('hostBtn').disabled = $('joinBtn').disabled = $('joinGo').disabled = true;
+  setStatus('Connecting…');
+
+  peer = new Peer({ debug: 1 });
+  peer.on('open', () => {
+    // Unreliable + unordered: snapshots are self-contained, so a lost packet
+    // must never hold up the next one behind a retransmit.
+    const conn = peer.connect(raw, { reliable: false, serialization: 'json' });
+    conn.on('open', () => {
+      Client.start(conn, input, setStatus);
+      setStatus('Connected.');
+      begin(Client);
+    });
+    conn.on('data', msg => Client.onData(msg));
+    conn.on('close', () => { setStatus('Disconnected from host.'); running = false; });
+    conn.on('error', () => setStatus('Connection error.'));
+  });
+  peer.on('error', e => {
+    setStatus(e.type === 'peer-unavailable' ? 'No host with that code.' : 'Peer error: ' + e.type);
+    $('hostBtn').disabled = $('joinBtn').disabled = $('joinGo').disabled = false;
+  });
+};
+
+resize();
+})();
+</script>
+</body>
+</html>
