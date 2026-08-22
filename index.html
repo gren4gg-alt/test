@@ -213,7 +213,8 @@ function hud() {
     hudEl.textContent =
       `CLIENT slot:${Client.mySlot}  gap:${Math.round(s.gap)}ms  since:${stale}ms  ` +
       `delay:${Client.jitter ? Client.jitter.delay.toFixed(0) : '–'}ms(adaptive)  ` +
-      `snaps:${s.snaps}  teleports:${s.teleports}  reordered:${s.reordered}  late:${s.lateDropped}`;
+      `snaps:${s.snaps}  teleports:${s.teleports}  reordered:${s.reordered}  ` +
+      `late:${s.lateDropped}  ice-flags:${s.instabilityEvents}`;
   }
 }
 
@@ -280,6 +281,21 @@ $('joinGo').onclick = () => {
     conn.on('open', () => {
       Client.start(conn, input, setStatus, endSession);
       setStatus('Connected — waiting for the host to start…');
+
+      // The DataConnection sits on top of a real RTCPeerConnection, which
+      // WebRTC itself monitors for path health (dropped STUN checks, a
+      // wifi/cellular handoff, a NAT rebind). 'disconnected' is a volatile,
+      // often-transient state — even a single dropped UDP packet can
+      // trigger it — so this isn't treated as a fatal error, just an early
+      // cue to widen the interpolation buffer defensively before any of
+      // this shows up as a missed snapshot on our end.
+      const pc = conn.peerConnection;
+      if (pc) {
+        pc.addEventListener('iceconnectionstatechange', () => {
+          const st = pc.iceConnectionState;
+          if (st === 'disconnected' || st === 'failed') Client.flagUnstable();
+        });
+      }
     });
     conn.on('data', msg => {
       Client.onData(msg);
