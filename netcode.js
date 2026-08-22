@@ -48,45 +48,30 @@ const { World, Player, Box, MovingPlatform } = window.Engine;
    CONFIG
    =========================================================================== */
 const CFG = {
-  // 60Hz sim: precise physics tick. Only the host uses this, so it can
-  // change without desyncing anyone — clients never simulate.
-  SIM_HZ:           60,
-  // Broadcast every tick the host computes. With no client-side prediction,
-  // snapshot rate is the only lever for responsiveness, so there is no
-  // reason to send less often than the host has new state — SNAPSHOT_HZ
-  // is pinned to SIM_HZ rather than given its own number.
-  SNAPSHOT_HZ:      60,
+  SIM_HZ:           90,     // up from 60 — real gain shrinks from here, and
+                             // this is the number that costs host CPU most
+  SNAPSHOT_HZ:      90,     // stays pinned to SIM_HZ
+
   MAX_PLAYERS:      8,
 
-  MAX_CATCHUP_MS:   200,    // clamp frame delta; no post-stall spiral
-  MAX_STEPS_FRAME:  4,      // never let one frame run away
+  MAX_CATCHUP_MS:   200,
+  MAX_STEPS_FRAME:  6,      // was 4 — needs headroom to catch up at 90Hz
+                             // if a frame runs long
 
-  // Interpolation delay is ADAPTIVE (see JitterTracker) rather than a fixed
-  // number. These are the floor and ceiling it's allowed to settle between.
-  // The floor follows Valve's Source engine default (cl_interp_ratio = 2):
-  // always keep ~2 full snapshots buffered — (1000/60) * 2 ≈ 33ms. That's
-  // the same number Counter-Strike/TF2 ship as default, not a guess; going
-  // lower is possible but trades away the safety margin the buffer exists
-  // for, which is why it isn't the default here either.
-  INTERP_DELAY_MIN: 33,
-  INTERP_DELAY_MAX: 200,
-  INTERP_DELAY_START: 40,   // initial guess before we've measured anything
-  JITTER_EWMA:      0.12,   // how fast the estimate reacts to new gaps
-  JITTER_MARGIN:    3.0,    // delay = 2 snapshot intervals + MARGIN * jitter
-  SNAP_BUFFER:      28,     // headroom for the larger end of the adaptive range
+  INTERP_DELAY_MIN: 22,     // 2 snapshots at 90Hz = 1000/90 * 2 ≈ 22ms
+  INTERP_DELAY_MAX: 180,
+  INTERP_DELAY_START: 28,
+  JITTER_EWMA:      0.12,
+  JITTER_MARGIN:    3.0,
+  SNAP_BUFFER:      32,     // more headroom, snapshots arrive faster
 
-  // If two consecutive snapshots for the same entity differ by more than
-  // this, treat it as a teleport/respawn rather than a slide: jump straight
-  // to the newer position instead of interpolating across the whole level.
   TELEPORT_DIST:    140,
 
-  // Session
-  HOST_TIMEOUT_MS:  2500,     // no snapshot this long => host is gone
-  INPUT_KEEPALIVE_MS: 80,     // resend held input at least this often
+  HOST_TIMEOUT_MS:  2500,
+  INPUT_KEEPALIVE_MS: 60,   // was 80 — matches the faster tick
 
-  // Security
   MAX_MSG_BYTES:    2048,
-  MAX_MSG_PER_SEC:  110,
+  MAX_MSG_PER_SEC:  160,    // was 110 — 90Hz traffic needs more headroom
 };
 const SIM_DT  = 1 / CFG.SIM_HZ;
 const SIM_MS  = 1000 / CFG.SIM_HZ;
