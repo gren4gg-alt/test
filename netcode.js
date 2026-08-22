@@ -286,28 +286,49 @@ class Tween {
 const Host = {
   nw: null, tw: null, peers: new Map(), slots: new Map(), used: new Set(),
   tick: 0, acc: 0, snapAcc: 0, last: 0, mySlot: -1, selfId: null, alive: true,
+  started: false,
   stats: { steps: 0, simMs: 0 },
 
-  start(peer, input, onStatus, onEnd) {
+  /**
+   * Open the room for connections while the host is still on the lobby
+   * screen. Players can join and get a slot, but nothing simulates or
+   * broadcasts yet — that only begins once the host presses Start (see
+   * start() below). This is what makes "host presses Start" the actual
+   * gate on entering the room, not just a UI delay.
+   */
+  prepare(peer, onStatus) {
     this.nw = buildWorld();
     this.tw = new Tween();
-    this.input = input;
     this.onStatus = onStatus || function () {};
-    this.onEnd = onEnd || function () {};
     this.selfId = peer.id;
     this.alive = true;
+    this.started = false;
     this.mySlot = this.claim(peer.id);
     makePlayer(this.nw, this.mySlot);
     this.peers.set(peer.id, { conn: null, mask: 0, lastSeq: 0, allow: () => true });
     this.tw.before(this.nw.world); this.tw.after(this.nw.world);
     peer.on('connection', c => this.onConn(c));
-    this.last = performance.now();
 
-    // The host is the server: leaving ends the session for everyone. Tell
-    // them explicitly rather than letting them sit on a frozen world.
     this._bye = () => this.shutdown();
     window.addEventListener('pagehide', this._bye);
     window.addEventListener('beforeunload', this._bye);
+  },
+
+  /** Begin simulating and broadcasting. Only called once, on Start. */
+  start(peer, input, onStatus, onEnd) {
+    this.input = input;
+    if (onStatus) this.onStatus = onStatus;
+    this.onEnd = onEnd || function () {};
+    this.started = true;
+    this.last = performance.now();
+    // Anyone who connected during the lobby wait gets their welcome now.
+    for (const [peerId, p] of this.peers) {
+      if (p.conn && p.conn.open) {
+        const slot = this.slots.get(peerId);
+        try { p.conn.send({ type: 'welcome', slot, simHz: CFG.SIM_HZ }); } catch {}
+      }
+    }
+    this.report();
   },
 
   claim(id) {
@@ -330,7 +351,15 @@ const Host = {
       this.peers.set(conn.peer, {
         conn, mask: 0, lastSeq: 0, allow: rateLimiter(CFG.MAX_MSG_PER_SEC),
       });
-      try { conn.send({ type: 'welcome', slot, simHz: CFG.SIM_HZ }); } catch {}
+      // Reserve their slot and let them know they're queued, but withhold
+      // 'welcome' until the host actually presses Start — that message is
+      // what lets a client enter the room, so gating it here is the real
+      // enforcement point, not just a UI-level delay.
+      if (this.started) {
+        try { conn.send({ type: 'welcome', slot, simHz: CFG.SIM_HZ }); } catch {}
+      } else {
+        try { conn.send({ type: 'queued' }); } catch {}
+      }
       this.report();
     });
     conn.on('data', msg => this.onData(conn, msg));
@@ -364,7 +393,10 @@ const Host = {
   },
 
   report() {
-    this.onStatus(`Hosting — ${Math.max(0, this.peers.size - 1)} player(s) joined.`);
+    const n = Math.max(0, this.peers.size - 1);
+    this.onStatus(this.started
+      ? `Hosting — ${n} player(s) in game.`
+      : `Room open — ${n} player(s) waiting. Press Start when ready.`);
   },
 
   /** End the session for everyone. */
@@ -404,7 +436,7 @@ const Host = {
   },
 
   update(now) {
-    if (!this.alive) return;
+    if (!this.alive || !this.started) return;
     let d = now - this.last; this.last = now;
     if (d > CFG.MAX_CATCHUP_MS) d = CFG.MAX_CATCHUP_MS;
     this.acc += d;
