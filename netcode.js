@@ -58,12 +58,16 @@ const CFG = {
   MAX_STEPS_FRAME:  6,      // was 4 — needs headroom to catch up at 90Hz
                              // if a frame runs long
 
-  INTERP_DELAY_MIN: 22,     // 2 snapshots at 90Hz = 1000/90 * 2 ≈ 22ms
-  INTERP_DELAY_MAX: 180,
-  INTERP_DELAY_START: 28,
-  JITTER_EWMA:      0.12,
-  JITTER_MARGIN:    3.0,
-  SNAP_BUFFER:      32,     // more headroom, snapshots arrive faster
+ INTERP_DELAY_MIN: 40,     // was 33 — real-world jitter is showing up, so
+                             // the floor should reflect that, not the
+                             // clean-network best case
+  INTERP_DELAY_MAX: 220,
+  INTERP_DELAY_START: 50,
+  JITTER_EWMA:      0.22,   // was 0.12 — reacts to bursts of reordering
+                             // faster instead of easing in slowly
+  JITTER_MARGIN:    4.5,    // was 3.0 — more headroom per unit of measured
+                             // jitter, since you're confirming real jitter exists
+  SNAP_BUFFER:      32,    // more headroom, snapshots arrive faster
 
   TELEPORT_DIST:    140,
 
