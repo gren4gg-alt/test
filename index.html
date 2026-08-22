@@ -27,6 +27,10 @@
           max-width:90vw; text-align:center; }
   #status { font-size:13px; color:#8a8aa0; min-height:1.2em; text-align:center; }
 
+  #ended { position:fixed; inset:0; z-index:30; display:none; flex-direction:column;
+           align-items:center; justify-content:center; gap:16px; background:rgba(20,20,28,.94);
+           text-align:center; padding:24px; }
+  #ended.on { display:flex; }
   #stage { position:fixed; inset:0; display:none; }
   #stage.on { display:block; }
   canvas { display:block; width:100%; height:100%; touch-action:none; }
@@ -73,6 +77,11 @@
   </div>
   <div id="code" hidden></div>
   <div id="status"></div>
+</div>
+
+<div id="ended">
+  <div style="font-size:18px;font-weight:600" id="endedMsg">Session ended</div>
+  <button id="endedBtn">Back</button>
 </div>
 
 <div id="stage">
@@ -195,15 +204,14 @@ function hud() {
   if (side === Host) {
     hudEl.textContent =
       `HOST players:${Host.nw.players.size}  tick:${Host.tick}  ` +
-      `steps/frame:${Host.stats.stepsFrame}  sim:${Host.stats.simMs.toFixed(1)}ms  ` +
+      `steps:${Host.stats.steps}  sim:${Host.stats.simMs.toFixed(2)}ms  ` +
       `${CFG.SIM_HZ}Hz sim / ${CFG.SNAPSHOT_HZ}Hz net`;
   } else {
     const s = Client.stats;
     const stale = s.lastRecv ? Math.round(performance.now() - s.lastRecv) : 0;
     hudEl.textContent =
       `CLIENT slot:${Client.mySlot}  gap:${Math.round(s.gap)}ms  since:${stale}ms  ` +
-      `replay:${s.replays}t  sim:${s.simMs.toFixed(1)}ms  ` +
-      `skipped:${pct(s.accepted, s.rollbacks)}%  budget-hits:${s.budgetHits}`;
+      `sim:${s.simMs.toFixed(2)}ms  snaps:${s.snaps}  snaps-corrected:${s.corrections}`;
   }
 }
 
@@ -214,6 +222,14 @@ function frame(now) {
   hud();
   requestAnimationFrame(frame);
 }
+
+function endSession(reason) {
+  running = false;
+  document.getElementById('endedMsg').textContent = reason || 'Session ended';
+  document.getElementById('ended').classList.add('on');
+  try { if (peer && !peer.destroyed) peer.destroy(); } catch (e) {}
+}
+document.getElementById('endedBtn').onclick = () => location.reload();
 
 function begin(which) {
   side = which;
@@ -230,7 +246,7 @@ $('hostBtn').onclick = () => {
   setStatus('Creating room…');
   peer = new Peer({ debug: 1 });
   peer.on('open', id => {
-    Host.start(peer, input, setStatus);
+    Host.start(peer, input, setStatus, endSession);
     codeEl.hidden = false;
     codeEl.textContent = id;
     setStatus('Share this code, then press anything to play.');
@@ -254,12 +270,12 @@ $('joinGo').onclick = () => {
     // must never hold up the next one behind a retransmit.
     const conn = peer.connect(raw, { reliable: false, serialization: 'json' });
     conn.on('open', () => {
-      Client.start(conn, input, setStatus);
+      Client.start(conn, input, setStatus, endSession);
       setStatus('Connected.');
       begin(Client);
     });
     conn.on('data', msg => Client.onData(msg));
-    conn.on('close', () => { setStatus('Disconnected from host.'); running = false; });
+    conn.on('close', () => endSession('Host ended the session.'));
     conn.on('error', () => setStatus('Connection error.'));
   });
   peer.on('error', e => {
