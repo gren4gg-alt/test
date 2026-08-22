@@ -48,30 +48,30 @@ const { World, Player, Box, MovingPlatform } = window.Engine;
    CONFIG
    =========================================================================== */
 const CFG = {
-  // 60Hz sim. Only the host uses this, so it can change without desyncing
+  // 75Hz sim. Only the host uses this, so it can change without desyncing
   // anyone — clients never simulate, only interpolate what the host sends.
-  SIM_HZ:           60,
+  SIM_HZ:           75,
   // Broadcast every tick the host computes. With no client-side prediction,
   // snapshot rate is the only lever left for responsiveness, so there is no
   // reason to send less often than the host has new state — SNAPSHOT_HZ
   // is pinned to SIM_HZ below rather than given its own number.
-  SNAPSHOT_HZ:      60,
+  SNAPSHOT_HZ:      75,
   MAX_PLAYERS:      8,
 
   MAX_CATCHUP_MS:   200,    // clamp frame delta; no post-stall spiral
-  MAX_STEPS_FRAME:  6,      // was 4 — a 200ms stall now needs more 60Hz
-                             // steps to catch up than it did at 45Hz
+  MAX_STEPS_FRAME:  7,      // was 6 at 60Hz — a 200ms stall now needs more
+                             // 75Hz steps to catch up than it did at 60Hz
 
   // Interpolation delay is ADAPTIVE (see JitterTracker below) rather than a
   // fixed number. These are the floor and ceiling it's allowed to settle
   // between. The floor follows Source engine's default (cl_interp_ratio=2):
-  // always keep ~2 snapshots buffered — (1000/60)*2 ≈ 33ms.
-  INTERP_DELAY_MIN: 33,
+  // always keep ~2 snapshots buffered — (1000/75)*2 ≈ 27ms.
+  INTERP_DELAY_MIN: 27,
   INTERP_DELAY_MAX: 200,
-  INTERP_DELAY_START: 40,   // initial guess before we've measured anything
+  INTERP_DELAY_START: 33,   // initial guess before we've measured anything
   JITTER_EWMA:      0.12,   // how fast the estimate reacts to new gaps
   JITTER_MARGIN:    3.0,    // delay = 2 snapshot intervals + MARGIN * jitter
-  SNAP_BUFFER:      28,     // headroom for the larger end of the adaptive range
+  SNAP_BUFFER:      32,     // headroom for the larger end of the adaptive range
 
   // If two consecutive snapshots for the same entity differ by more than
   // this, treat it as a teleport/respawn rather than a slide: jump straight
@@ -88,11 +88,11 @@ const CFG = {
 
   // Session
   HOST_TIMEOUT_MS:  2500,     // no snapshot this long => host is gone
-  INPUT_KEEPALIVE_MS: 80,     // was 100 — matches the faster tick
+  INPUT_KEEPALIVE_MS: 65,     // was 80 at 60Hz — matches the faster tick
 
   // Security
   MAX_MSG_BYTES:    2048,
-  MAX_MSG_PER_SEC:  110,      // was 90 — 60Hz keepalive traffic needs headroom
+  MAX_MSG_PER_SEC:  140,      // was 110 at 60Hz — 75Hz keepalive traffic needs headroom
 };
 const SIM_DT  = 1 / CFG.SIM_HZ;
 const SIM_MS  = 1000 / CFG.SIM_HZ;
