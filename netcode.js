@@ -78,6 +78,14 @@ const CFG = {
   // to the newer position instead of interpolating across the whole level.
   TELEPORT_DIST:    140,
 
+  // Ultimate backstop: HOST_TIMEOUT_MS only starts counting once the FIRST
+  // snapshot has arrived (see update() below). If nothing ever arrives at
+  // all — a fundamentally broken data channel, not just one lost packet —
+  // that check never fires, since its trigger condition itself never
+  // becomes true. This timeout is independent of that one and covers exactly
+  // that case: total silence from the moment the connection opened.
+  HANDSHAKE_TIMEOUT_MS: 8000,   // comfortably past RETRY_MAX * RETRY_MS (2.4s)
+
   // Session
   HOST_TIMEOUT_MS:  2500,     // no snapshot this long => host is gone
   INPUT_KEEPALIVE_MS: 80,     // was 100 — matches the faster tick
@@ -212,6 +220,42 @@ function rateLimiter(perSec) {
     if (tokens < 1) return false;
     tokens -= 1; return true;
   };
+}
+
+/* ===========================================================================
+   RELIABLE HANDSHAKE DELIVERY
+   ---------------------------------------------------------------------------
+   The data channel is deliberately unreliable+unordered for continuous game
+   state — a dropped snapshot is meaningless, the next one supersedes it. A
+   handful of one-shot control messages ('welcome' above all) are a different
+   animal: 'welcome' is the ONLY thing that tells a client its slot and lets
+   it enter the room. If that single packet is lost, nothing else ever
+   corrects it — the client just sits waiting forever with no visible error.
+   That's a real single point of failure, not a theoretical one.
+
+   The fix is the standard one for a critical message on an unreliable
+   transport: resend it periodically until the receiver confirms it arrived,
+   capped so a genuinely dead connection doesn't retry forever.
+   =========================================================================== */
+const RETRY_MS = 400, RETRY_MAX = 6;   // ~2.4s of coverage, well under HOST_TIMEOUT_MS
+
+function sendReliable(conn, msg, key, pendingAcks) {
+  if (!conn || !conn.open) return;
+  let attempts = 0;
+  const fire = () => {
+    if (!conn.open || pendingAcks.get(key) !== timer) return;
+    try { conn.send(msg); } catch {}
+    attempts++;
+    if (attempts >= RETRY_MAX) { pendingAcks.delete(key); return; }
+  };
+  const timer = setInterval(fire, RETRY_MS);
+  pendingAcks.set(key, timer);
+  fire();   // send immediately, don't wait for the first interval tick
+}
+
+function ackReliable(pendingAcks, key) {
+  const timer = pendingAcks.get(key);
+  if (timer) { clearInterval(timer); pendingAcks.delete(key); }
 }
 
 /* ===========================================================================
@@ -392,6 +436,7 @@ const Host = {
   nw: null, tw: null, peers: new Map(), slots: new Map(), used: new Set(),
   tick: 0, acc: 0, snapAcc: 0, last: 0, mySlot: -1, selfId: null, alive: true,
   started: false,
+  pendingAcks: new Map(),   // peerId -> Map(msgKey -> intervalTimer)
   stats: { steps: 0, simMs: 0 },
 
   /**
@@ -429,11 +474,17 @@ const Host = {
     // Anyone who connected during the lobby wait gets their welcome now.
     for (const [peerId, p] of this.peers) {
       if (p.conn && p.conn.open) {
-        const slot = this.slots.get(peerId);
-        try { p.conn.send({ type: 'welcome', slot, simHz: CFG.SIM_HZ }); } catch {}
+        this.sendWelcome(peerId, this.slots.get(peerId));
       }
     }
     this.report();
+  },
+
+  sendWelcome(peerId, slot) {
+    const p = this.peers.get(peerId);
+    if (!p || !p.conn) return;
+    if (!this.pendingAcks.has(peerId)) this.pendingAcks.set(peerId, new Map());
+    sendReliable(p.conn, { type: 'welcome', slot, simHz: CFG.SIM_HZ }, 'welcome', this.pendingAcks.get(peerId));
   },
 
   claim(id) {
@@ -461,7 +512,7 @@ const Host = {
       // what lets a client enter the room, so gating it here is the real
       // enforcement point, not just a UI-level delay.
       if (this.started) {
-        try { conn.send({ type: 'welcome', slot, simHz: CFG.SIM_HZ }); } catch {}
+        this.sendWelcome(conn.peer, slot);
       } else {
         try { conn.send({ type: 'queued' }); } catch {}
       }
@@ -475,8 +526,16 @@ const Host = {
   onData(conn, msg) {
     const p = this.peers.get(conn.peer);
     if (!p) return;
-    if (!p.allow()) return;                  // flood
-    if (!Validate.size(msg)) return;         // oversized
+    if (!p.allow()) return;                  // flood — applies to every message type
+    if (!Validate.size(msg)) return;         // oversized — applies to every message type
+
+    // Ack for a reliably-retried handshake message — cancel the resend loop.
+    if (msg && msg.type === 'ack' && typeof msg.for === 'string' && msg.for.length <= 32) {
+      const acks = this.pendingAcks.get(conn.peer);
+      if (acks) ackReliable(acks, msg.for);
+      return;
+    }
+
     const inp = Validate.input(msg);
     if (!inp) return;                        // malformed
     if (inp.seq <= p.lastSeq) return;        // stale / replayed / out of order
@@ -485,6 +544,8 @@ const Host = {
   },
 
   drop(peerId) {
+    const acks = this.pendingAcks.get(peerId);
+    if (acks) { for (const t of acks.values()) clearInterval(t); this.pendingAcks.delete(peerId); }
     const slot = this.slots.get(peerId);
     if (slot !== undefined) {
       const e = this.nw.players.get(slot);
@@ -511,6 +572,10 @@ const Host = {
     for (const p of this.peers.values()) {
       if (p.conn && p.conn.open) { try { p.conn.send({ type: 'bye' }); } catch {} }
     }
+    for (const acks of this.pendingAcks.values()) {
+      for (const t of acks.values()) clearInterval(t);
+    }
+    this.pendingAcks.clear();
     window.removeEventListener('pagehide', this._bye);
     window.removeEventListener('beforeunload', this._bye);
     this.onEnd('You ended the session.');
@@ -614,6 +679,14 @@ const Client = {
     this.clock = new TickClock(SIM_MS);
     this._floorTick = -1;     // ticks at/below this are too late to matter
 
+    // Backstop against total silence — see CFG.HANDSHAKE_TIMEOUT_MS comment.
+    clearTimeout(this._handshakeTimer);
+    this._handshakeTimer = setTimeout(() => {
+      if (this.alive && this.mySlot < 0) {
+        this.end('No response from host — check the room code and try again.');
+      }
+    }, CFG.HANDSHAKE_TIMEOUT_MS);
+
     // Nothing on the client simulates, so nothing needs to be dynamic —
     // every entity here is a positioned prop, not a physics body.
     for (const b of this.nw.boxes) { b.dynamic = false; b.pushable = false; }
@@ -627,6 +700,11 @@ const Client = {
 
     if (msg.type === 'welcome') {
       if (!Number.isInteger(msg.slot) || msg.slot < 0 || msg.slot >= CFG.MAX_PLAYERS) return;
+      clearTimeout(this._handshakeTimer);
+      // Ack immediately so the host's resend loop stops. Safe to ack even
+      // if this is a retry we've already seen — the host only cares that
+      // ONE ack eventually lands, not which attempt it corresponds to.
+      try { this.conn.send({ type: 'ack', for: 'welcome' }); } catch {}
       this.mySlot = msg.slot;
       makePlayer(this.nw, msg.slot).dynamic = false;
       return;
@@ -697,6 +775,7 @@ const Client = {
   end(reason) {
     if (!this.alive) return;
     this.alive = false;
+    clearTimeout(this._handshakeTimer);
     this.onEnd(reason);
   },
 
