@@ -213,7 +213,7 @@ function hud() {
     hudEl.textContent =
       `CLIENT slot:${Client.mySlot}  gap:${Math.round(s.gap)}ms  since:${stale}ms  ` +
       `delay:${Client.jitter ? Client.jitter.delay.toFixed(0) : '–'}ms(adaptive)  ` +
-      `snaps:${s.snaps}  teleports:${s.teleports}  oob:${s.outOfOrder}`;
+      `snaps:${s.snaps}  teleports:${s.teleports}  reordered:${s.reordered}  late:${s.lateDropped}`;
   }
 }
 
