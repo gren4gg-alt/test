@@ -47,25 +47,31 @@ const { World, Player, Box, MovingPlatform } = window.Engine;
 /* ===========================================================================
    CONFIG
    =========================================================================== */
-/*const CFG = {
+const CFG = {
   // 45Hz sim: a third less CPU than 60 for physics that is not twitch-precise.
   // Only the host uses this, so it can change without desyncing anyone.
   SIM_HZ:           45,
-  SNAPSHOT_HZ:      22,     // every 2nd sim tick
+  // Broadcast every tick the host computes. With no client-side prediction,
+  // snapshot rate is the only lever left for responsiveness, so there is no
+  // reason to send less often than the host has new state — SNAPSHOT_HZ
+  // is pinned to SIM_HZ below rather than given its own number.
+  SNAPSHOT_HZ:      45,
   MAX_PLAYERS:      8,
 
   MAX_CATCHUP_MS:   200,    // clamp frame delta; no post-stall spiral
   MAX_STEPS_FRAME:  4,      // never let one frame run away
 
-  // Interpolation: render remote things this far behind, so we always have
-  // two real snapshots to blend and never have to guess forward.
-  INTERP_DELAY_MS:  95,     // ~2 snapshot intervals
+  // Interpolation: render everything (including the local player) this far
+  // behind, so there are always two real snapshots to blend between and we
+  // never have to guess forward. At 45Hz snapshots two intervals is ~44ms;
+  // a little slack is kept for network jitter.
+  INTERP_DELAY_MS:  55,
   SNAP_BUFFER:      16,
 
-  // Local player correction (no rollback — just ease toward authority)
-  PULL:             0.22,   // fraction of positional error corrected per snapshot
-  PULL_VEL:         0.30,
-  SNAP_DIST:        90,     // beyond this, hard snap (teleport/respawn)
+  // If two consecutive snapshots for the same entity differ by more than
+  // this, treat it as a teleport/respawn rather than a slide: jump straight
+  // to the newer position instead of interpolating across the whole level.
+  TELEPORT_DIST:    140,
 
   // Session
   HOST_TIMEOUT_MS:  2500,   // no snapshot this long => host is gone
@@ -74,33 +80,11 @@ const { World, Player, Box, MovingPlatform } = window.Engine;
   // Security
   MAX_MSG_BYTES:    2048,
   MAX_MSG_PER_SEC:  90,
-};*/
-const CFG = {
-  SIM_HZ:           60,
-  SNAPSHOT_HZ:      60,
-
-  INTERP_DELAY_MS:  50,
-  SNAP_BUFFER:      8,
-
-  // Prediction disabled, so these won't matter
-  PULL:             0,
-  PULL_VEL:         0,
-
-  SNAP_DIST:        90,
-
-  MAX_CATCHUP_MS:   150,
-  MAX_STEPS_FRAME:  3,
-
-  HOST_TIMEOUT_MS:  2500,
-  INPUT_KEEPALIVE_MS: 50,
-
-  MAX_MSG_BYTES:    2048,
-  MAX_MSG_PER_SEC:  100,
-  MAX_PLAYERS:      8,
 };
 const SIM_DT  = 1 / CFG.SIM_HZ;
 const SIM_MS  = 1000 / CFG.SIM_HZ;
-const SNAP_MS = 1000 / CFG.SNAPSHOT_HZ;
+// SNAPSHOT_HZ is pinned to SIM_HZ (see CFG comment) — the host broadcasts
+// once per step, so there is no separate snapshot interval to track.
 
 const PALETTE = ['#4bd07a','#e06c75','#61afef','#e5c07b','#c678dd','#56b6c2','#d19a66','#f28fd0'];
 
@@ -471,14 +455,15 @@ const Host = {
       this.step();
       this.tw.after(this.nw.world);
       this.acc -= SIM_MS; steps++;
+      // SNAPSHOT_HZ == SIM_HZ: every tick the host computes goes straight
+      // out. There's no separate broadcast accumulator to fall out of sync
+      // with the sim one, and no reason to hold a tick back.
+      this.broadcast();
     }
     // Can't keep up: shed the backlog instead of compounding debt.
     if (steps >= CFG.MAX_STEPS_FRAME) this.acc = 0;
     this.stats.steps = steps;
     this.stats.simMs = performance.now() - t0;
-
-    this.snapAcc += d;
-    if (this.snapAcc >= SNAP_MS) { this.snapAcc %= SNAP_MS; this.broadcast(); }
   },
 
   world() { return this.nw.world; },
@@ -488,15 +473,32 @@ const Host = {
 /* ===========================================================================
    CLIENT
    ---------------------------------------------------------------------------
-   Simulates exactly one dynamic body: the local player. Everything else is
-   positioned by interpolating snapshots, which costs a lerp per entity.
+   No client-side simulation at all — not even of the local player. Every
+   entity, including your own, is positioned purely by interpolating between
+   two real snapshots from the host. There is no prediction, no rollback, no
+   correction/easing, and nothing here needs to know how engine.js physics
+   actually works.
+
+   TRADE-OFF, STATED PLAINLY
+   Your own input now has full round-trip latency before you see it move —
+   press a key, it goes to the host, the host simulates it, a snapshot comes
+   back, and only then does your square move. There is no local prediction
+   masking that gap. What compensates is snapshot rate: the host broadcasts
+   every tick it computes (SNAPSHOT_HZ == SIM_HZ, see CFG above), so the gap
+   is one round trip, not one round trip plus a coarse update interval.
+
+   WHY THIS IS SIMPLER, NOT JUST DIFFERENT
+   No PredictionHistory, no mispredict-gate, no replay budget, no easing
+   constants, no "what if the client's physics disagrees with the host's"
+   category of bug at all, because the client no longer HAS physics. The
+   only moving part left is picking two snapshots and lerping.
    =========================================================================== */
 const Client = {
-  nw: null, conn: null, mySlot: -1, me: null,
-  buf: [], seq: 0, acc: 0, last: 0, alive: false,
+  nw: null, conn: null, mySlot: -1,
+  buf: [], seq: 0, last: 0, alive: false,
   _sentMask: -1, _sentAt: 0,
   _out: [],
-  stats: { gap: 0, lastRecv: 0, simMs: 0, corrections: 0, snaps: 0 },
+  stats: { gap: 0, lastRecv: 0, snaps: 0, teleports: 0 },
 
   start(conn, input, onStatus, onEnd) {
     this.nw = buildWorld();
@@ -505,12 +507,13 @@ const Client = {
     this.onStatus = onStatus || function () {};
     this.onEnd = onEnd || function () {};
     this.buf = [];
+    this.seq = 0;
+    this._sentMask = -1; this._sentAt = 0;
     this.alive = true;
     this.last = performance.now();
 
-    // Only our own player is dynamic here. Boxes are placed from snapshots
-    // instead of being simulated, so they still block and carry us correctly
-    // without costing a physics body.
+    // Nothing on the client simulates, so nothing needs to be dynamic —
+    // every entity here is a positioned prop, not a physics body.
     for (const b of this.nw.boxes) { b.dynamic = false; b.pushable = false; }
   },
 
@@ -523,7 +526,7 @@ const Client = {
     if (msg.type === 'welcome') {
       if (!Number.isInteger(msg.slot) || msg.slot < 0 || msg.slot >= CFG.MAX_PLAYERS) return;
       this.mySlot = msg.slot;
-      this.me = makePlayer(this.nw, msg.slot);
+      makePlayer(this.nw, msg.slot).dynamic = false;
       return;
     }
 
@@ -541,38 +544,6 @@ const Client = {
     snap.recvAt = now;
     this.buf.push(snap);
     if (this.buf.length > CFG.SNAP_BUFFER) this.buf.shift();
-
-    this.correct(snap);
-  },
-
-  /**
-   * Ease our locally-simulated player toward the host's view. No rollback:
-   * we take a fraction of the error each snapshot, which converges quickly
-   * and stays invisible, where a hard correction would pop. A large error
-   * means something discrete happened (respawn, teleport) so we snap.
-   */
-  correct(snap) {
-    if (!this.me || this.mySlot < 0) return;
-    let auth = null;
-    for (const p of snap.players) if (p.slot === this.mySlot) { auth = p; break; }
-    if (!auth) return;
-
-    const dx = auth.x - this.me.x, dy = auth.y - this.me.y;
-    const dist = Math.hypot(dx, dy);
-    if (dist > CFG.SNAP_DIST) {
-      this.me.x = auth.x; this.me.y = auth.y;
-      this.me.vx = 0; this.me.vy = 0;
-      this.stats.corrections++;
-      return;
-    }
-    this.me.x += dx * CFG.PULL;
-    this.me.y += dy * CFG.PULL;
-    // Authoritative grounded state matters: without it a client can think
-    // it's airborne (and refuse to jump) while the host says it's standing.
-    if (auth.flags & P_FLAG.GROUNDED) {
-      this.me.grounded = true;
-      if (this.me.vy > 0) this.me.vy *= (1 - CFG.PULL_VEL);
-    }
   },
 
   end(reason) {
@@ -581,7 +552,7 @@ const Client = {
     this.onEnd(reason);
   },
 
-  /** Find the two snapshots bracketing render time and blend them. */
+  /** Find the two snapshots bracketing render time. */
   interpolate() {
     const buf = this.buf;
     if (!buf.length) return null;
@@ -600,54 +571,52 @@ const Client = {
   },
 
   /**
-   * Push interpolated positions into the local world so that (a) rendering
-   * is smooth and (b) our own player collides against where things actually
-   * are right now.
+   * Position every entity — including our own player — purely from the
+   * bracketing snapshots. A per-pair distance check catches teleports
+   * (respawn, level transition): interpolating across the whole level in
+   * one frame would look like a slide, so a jump past TELEPORT_DIST snaps
+   * straight to the newer value instead of blending toward it.
    */
   applyInterpolated(iv) {
     if (!iv) return;
     const { older, newer, t } = iv;
-    const lerp = (a, b) => (newer ? a + (b - a) * t : a);
+    const blend = (a, b) => {
+      if (!newer) return a;
+      if (Math.abs(b - a) > CFG.TELEPORT_DIST) { this.stats.teleports++; return b; }
+      return a + (b - a) * t;
+    };
 
-    // Remote players: solid, positioned, never simulated.
     const seen = new Set();
     for (let i = 0; i < older.players.length; i++) {
       const a = older.players[i];
-      if (a.slot === this.mySlot) continue;
       seen.add(a.slot);
       let b = null;
       if (newer) for (const q of newer.players) if (q.slot === a.slot) { b = q; break; }
       const e = makePlayer(this.nw, a.slot);
       e.dynamic = false;
-      e.x = b ? lerp(a.x, b.x) : a.x;
-      e.y = b ? lerp(a.y, b.y) : a.y;
+      e.x = b ? blend(a.x, b.x) : a.x;
+      e.y = b ? blend(a.y, b.y) : a.y;
       e.facing = a.facing;
       e.grounded = !!(a.flags & P_FLAG.GROUNDED);
       e._carrying = !!(a.flags & P_FLAG.CARRYING);
     }
     for (const slot of Array.from(this.nw.players.keys())) {
-      if (slot !== this.mySlot && !seen.has(slot)) dropPlayer(this.nw, slot);
+      if (!seen.has(slot)) dropPlayer(this.nw, slot);
     }
 
     for (let i = 0; i < this.nw.boxes.length && i < older.boxes.length; i++) {
       const box = this.nw.boxes[i], a = older.boxes[i];
       const b = newer && newer.boxes[i];
-      box.x = b ? lerp(a.x, b.x) : a.x;
-      box.y = b ? lerp(a.y, b.y) : a.y;
+      box.x = b ? blend(a.x, b.x) : a.x;
+      box.y = b ? blend(a.y, b.y) : a.y;
       box.carried = !!(a.flags & B_FLAG.CARRIED);
-      // A carried box shouldn't block whoever's holding it; treating it as
-      // non-solid while held is close enough and costs nothing.
-      box.solid = !box.carried;
     }
 
     for (let i = 0; i < this.nw.platforms.length && i < older.platforms.length; i++) {
       const pl = this.nw.platforms[i], a = older.platforms[i];
       const b = newer && newer.platforms[i];
-      const nx = b ? lerp(a.x, b.x) : a.x;
-      const ny = b ? lerp(a.y, b.y) : a.y;
-      // dx/dy let engine.js carry riders correctly this frame.
-      pl.dx = nx - pl.x; pl.dy = ny - pl.y;
-      pl.x = nx; pl.y = ny;
+      pl.x = b ? blend(a.x, b.x) : a.x;
+      pl.y = b ? blend(a.y, b.y) : a.y;
     }
   },
 
@@ -668,38 +637,19 @@ const Client = {
       return;
     }
 
-    let d = now - this.last; this.last = now;
-    if (d > CFG.MAX_CATCHUP_MS) d = CFG.MAX_CATCHUP_MS;
-    this.acc += d;
-
-    // Position everything else from snapshots BEFORE stepping ourselves, so
-    // we collide against current positions.
     this.applyInterpolated(this.interpolate());
 
-    const t0 = performance.now();
-    let steps = 0;
-    while (this.acc >= SIM_MS && steps < CFG.MAX_STEPS_FRAME) {
-      this.acc -= SIM_MS; steps++;
-      if (!this.me) continue;
-      const mask = stateToMask(this.input.getState());
-      const st = maskToState(mask);
-      this.me._mask = mask;
-      this.me.handleInput(st, SIM_DT);
-      // Only our own body is simulated. Everything else is already placed.
-      this.nw.world.step(SIM_DT);
-      this.send(mask, now);
-    }
-    if (steps >= CFG.MAX_STEPS_FRAME) this.acc = 0;
-    this.stats.simMs = performance.now() - t0;
+    // Input is sampled every frame and sent independently of any sim
+    // step, because there is no client-side sim step anymore — only the
+    // host's tick rate matters for how fast an input takes effect.
+    if (this.mySlot >= 0) this.send(stateToMask(this.input.getState()), now);
+
+    this.last = now;
   },
 
   world() { return this.nw.world; },
 
-  /**
-   * Draw list. Everything is already at its interpolated position, and our
-   * own player is at its locally-simulated position, so this is a plain
-   * pass-through — no second layer of smoothing to fight the first.
-   */
+  /** Draw list. Every entity is already at its interpolated position. */
   renderList() {
     const out = this._out; out.length = 0;
     const ents = this.nw.world.entities;
