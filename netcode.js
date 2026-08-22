@@ -47,7 +47,7 @@ const { World, Player, Box, MovingPlatform } = window.Engine;
 /* ===========================================================================
    CONFIG
    =========================================================================== */
-const CFG = {
+/*const CFG = {
   // 45Hz sim: a third less CPU than 60 for physics that is not twitch-precise.
   // Only the host uses this, so it can change without desyncing anyone.
   SIM_HZ:           45,
@@ -74,6 +74,36 @@ const CFG = {
   // Security
   MAX_MSG_BYTES:    2048,
   MAX_MSG_PER_SEC:  90,
+};*/
+const CFG = {
+  // Physics
+  SIM_HZ:           50,
+
+  // Network
+  SNAPSHOT_HZ:      25,
+
+  // Remote-player interpolation
+  INTERP_DELAY_MS:  70,
+  SNAP_BUFFER:      8,
+
+  // Local-player correction
+  PULL:             0.15,
+  PULL_VEL:         0.20,
+  SNAP_DIST:        90,
+
+  // Frame protection
+  MAX_CATCHUP_MS:   150,
+  MAX_STEPS_FRAME:  3,
+
+  // Session
+  HOST_TIMEOUT_MS:  2500,
+  INPUT_KEEPALIVE_MS: 80,
+
+  // Security
+  MAX_MSG_BYTES:    2048,
+  MAX_MSG_PER_SEC:  60,
+
+  MAX_PLAYERS:      8,
 };
 const SIM_DT  = 1 / CFG.SIM_HZ;
 const SIM_MS  = 1000 / CFG.SIM_HZ;
