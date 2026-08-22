@@ -48,34 +48,43 @@ const { World, Player, Box, MovingPlatform } = window.Engine;
    CONFIG
    =========================================================================== */
 const CFG = {
-  SIM_HZ:           90,     // up from 60 — real gain shrinks from here, and
-                             // this is the number that costs host CPU most
-  SNAPSHOT_HZ:      90,     // stays pinned to SIM_HZ
-
+  // 45Hz sim: a third less CPU than 60 for physics that is not twitch-precise.
+  // Only the host uses this, so it can change without desyncing anyone.
+  SIM_HZ:           45,
+  // Broadcast every tick the host computes. With no client-side prediction,
+  // snapshot rate is the only lever left for responsiveness, so there is no
+  // reason to send less often than the host has new state — SNAPSHOT_HZ
+  // is pinned to SIM_HZ below rather than given its own number.
+  SNAPSHOT_HZ:      45,
   MAX_PLAYERS:      8,
 
-  MAX_CATCHUP_MS:   200,
-  MAX_STEPS_FRAME:  6,      // was 4 — needs headroom to catch up at 90Hz
-                             // if a frame runs long
+  MAX_CATCHUP_MS:   200,    // clamp frame delta; no post-stall spiral
+  MAX_STEPS_FRAME:  4,      // never let one frame run away
 
- INTERP_DELAY_MIN: 40,     // was 33 — real-world jitter is showing up, so
-                             // the floor should reflect that, not the
-                             // clean-network best case
+  // Interpolation delay is now ADAPTIVE (see JitterTracker below) rather
+  // than this fixed number. These are just the floor and ceiling it's
+  // allowed to settle between: never so low that ordinary jitter causes a
+  // buffer underrun, never so high that input feels sluggish on a clean
+  // connection. At 45Hz snapshots, two intervals is ~44ms.
+  INTERP_DELAY_MIN: 44,
   INTERP_DELAY_MAX: 220,
-  INTERP_DELAY_START: 50,
-  JITTER_EWMA:      0.22,   // was 0.12 — reacts to bursts of reordering
-                             // faster instead of easing in slowly
-  JITTER_MARGIN:    4.5,    // was 3.0 — more headroom per unit of measured
-                             // jitter, since you're confirming real jitter exists
-  SNAP_BUFFER:      32,    // more headroom, snapshots arrive faster
+  INTERP_DELAY_START: 55,   // initial guess before we've measured anything
+  JITTER_EWMA:      0.12,   // how fast the estimate reacts to new gaps
+  JITTER_MARGIN:    3.0,    // delay = 2 snapshot intervals + MARGIN * jitter
+  SNAP_BUFFER:      24,     // headroom for the larger end of the adaptive range
 
+  // If two consecutive snapshots for the same entity differ by more than
+  // this, treat it as a teleport/respawn rather than a slide: jump straight
+  // to the newer position instead of interpolating across the whole level.
   TELEPORT_DIST:    140,
 
-  HOST_TIMEOUT_MS:  2500,
-  INPUT_KEEPALIVE_MS: 60,   // was 80 — matches the faster tick
+  // Session
+  HOST_TIMEOUT_MS:  2500,   // no snapshot this long => host is gone
+  INPUT_KEEPALIVE_MS: 100,  // resend held input at least this often
 
+  // Security
   MAX_MSG_BYTES:    2048,
-  MAX_MSG_PER_SEC:  160,    // was 110 — 90Hz traffic needs more headroom
+  MAX_MSG_PER_SEC:  90,
 };
 const SIM_DT  = 1 / CFG.SIM_HZ;
 const SIM_MS  = 1000 / CFG.SIM_HZ;
@@ -141,6 +150,7 @@ const Codec = {
   /** Strict. Returns null on any malformation — never partial state. */
   decode(msg) {
     if (!msg || !Array.isArray(msg.p) || !Array.isArray(msg.b) || !Array.isArray(msg.m)) return null;
+    if (!Number.isInteger(msg.t) || msg.t < 0) return null;
     if (msg.p.length % 5 || msg.b.length % 3 || msg.m.length % 2) return null;
     if (msg.p.length / 5 > CFG.MAX_PLAYERS) return null;
 
@@ -263,6 +273,59 @@ function dropPlayer(nw, slot) {
    what jitter is actually being observed. It only ever grows or shrinks
    gradually, so the render timeline never jumps.
    =========================================================================== */
+/* ===========================================================================
+   TICK CLOCK
+   ---------------------------------------------------------------------------
+   The previous guard rejected ANY packet that arrived after a newer one
+   already had — but "arrived out of order" and "arrived too late to be
+   useful" are not the same thing. Since SNAPSHOT_HZ == SIM_HZ, every tick
+   the host sends represents a fixed, known slice of game time (SIM_MS
+   apart). That means a tick's number tells you exactly where it belongs on
+   the timeline, independent of when it happened to arrive — so a slightly
+   late, out-of-order packet can still be slotted into its correct place and
+   used, rather than thrown away just because something newer beat it here.
+
+   This reconstructs that timeline: given a tick number, it returns the
+   local time that tick SHOULD occupy, based on an anchor point that's
+   gently corrected over time (a small nudge per newest-seen tick, not a
+   hard reset) so it doesn't drift as the session goes on but also can't be
+   yanked around by a single jittery sample or a late packet.
+   =========================================================================== */
+class TickClock {
+  constructor(tickMs) {
+    this.tickMs = tickMs;
+    this.anchorTick = -1;
+    this.anchorAt = 0;
+    this.maxTick = -1;
+  }
+
+  /** The local time this tick belongs at. null if nothing's anchored yet. */
+  virtualTime(tick) {
+    if (this.anchorTick < 0) return null;
+    return this.anchorAt + (tick - this.anchorTick) * this.tickMs;
+  }
+
+  /**
+   * Feed the clock a newly-received tick. Only ticks that are the newest
+   * seen so far are allowed to correct the anchor — a reordered late packet
+   * describes the past and must not be allowed to yank the clock around.
+   */
+  observe(tick, recvAt) {
+    if (this.anchorTick < 0) {
+      this.anchorTick = tick; this.anchorAt = recvAt; this.maxTick = tick;
+      return recvAt;
+    }
+    if (tick > this.maxTick) {
+      const predicted = this.virtualTime(tick);
+      // Nudge, don't snap: recvAt is a single noisy sample of network delay,
+      // so only a small fraction of the error is corrected per observation.
+      this.anchorAt += (recvAt - predicted) * 0.04;
+      this.maxTick = tick;
+    }
+    return this.virtualTime(tick);
+  }
+}
+
 class JitterTracker {
   constructor() {
     this.meanGap = 1000 / CFG.SNAPSHOT_HZ;
@@ -531,10 +594,10 @@ const Host = {
 const Client = {
   nw: null, conn: null, mySlot: -1,
   buf: [], seq: 0, last: 0, alive: false,
-  jitter: null, _lastTick: -1,
+  jitter: null, clock: null, _floorTick: -1,
   _sentMask: -1, _sentAt: 0,
   _out: [],
-  stats: { gap: 0, lastRecv: 0, snaps: 0, teleports: 0, outOfOrder: 0 },
+  stats: { gap: 0, lastRecv: 0, snaps: 0, teleports: 0, reordered: 0, lateDropped: 0 },
 
   start(conn, input, onStatus, onEnd) {
     this.nw = buildWorld();
@@ -548,7 +611,8 @@ const Client = {
     this.alive = true;
     this.last = performance.now();
     this.jitter = new JitterTracker();
-    this._lastTick = -1;      // guards against an out-of-order (stale) snapshot
+    this.clock = new TickClock(SIM_MS);
+    this._floorTick = -1;     // ticks at/below this are too late to matter
 
     // Nothing on the client simulates, so nothing needs to be dynamic —
     // every entity here is a positioned prop, not a physics body.
@@ -572,24 +636,62 @@ const Client = {
     const snap = Codec.decode(msg);
     if (!snap) return;
 
-    // The connection is unreliable+unordered, so a delayed packet can
-    // arrive after a newer one already has. Using it would rubber-band the
-    // world backward for one frame, so anything at or behind the last
-    // accepted tick is dropped — not buffered, not blended, just discarded.
-    if (snap.tick <= this._lastTick) { this.stats.outOfOrder++; return; }
-    this._lastTick = snap.tick;
-
     const now = performance.now();
+
+    // Too late to matter: the floor advances as old buffer entries get
+    // trimmed (see trimBuffer below), meaning render time has already moved
+    // past this tick. There is nowhere left to insert it — using it now
+    // would mean rewinding what's already been shown. This is the only
+    // case that's actually "packet lost" from the client's perspective.
+    if (snap.tick <= this._floorTick) { this.stats.lateDropped++; return; }
+
+    // Find where this tick belongs. The buffer is kept sorted by tick, not
+    // by arrival order, so a packet that arrives late but still describes a
+    // moment we haven't rendered past yet gets slotted into its correct
+    // place instead of being thrown away just because something newer got
+    // here first.
+    let i = this.buf.length;
+    while (i > 0 && this.buf[i - 1].tick > snap.tick) i--;
+    if (i > 0 && this.buf[i - 1].tick === snap.tick) return;   // exact duplicate
+    if (i < this.buf.length) this.stats.reordered++;            // arrived out of order, but used
+
+    snap.recvAt = now;
+    snap.vt = this.clock.observe(snap.tick, now);
+    this.buf.splice(i, 0, snap);
+
     this.stats.gap = this.stats.lastRecv ? now - this.stats.lastRecv : 0;
     this.stats.lastRecv = now;
     this.stats.snaps++;
     this.jitter.sample(now);
 
-    // Timeline uses LOCAL receive time — the two machines' clocks are not
-    // synchronized and never will be.
-    snap.recvAt = now;
-    this.buf.push(snap);
-    if (this.buf.length > CFG.SNAP_BUFFER) this.buf.shift();
+    this.trimBuffer();
+  },
+
+  /**
+   * Drop buffered entries that render time has fully passed, and raise the
+   * floor to match. Kept separate from onData so both a normal push and a
+   * reordered insert go through the same trim + floor-advance logic.
+   */
+  trimBuffer() {
+    const at = performance.now() - this.jitter.delay;
+    const buf = this.buf;
+    // Keep at least one entry at/before render time (needed as "older") —
+    // trim everything strictly before that one.
+    let keepFrom = 0;
+    for (let i = 0; i < buf.length - 1; i++) {
+      if (buf[i + 1].vt <= at) keepFrom = i + 1; else break;
+    }
+    if (keepFrom > 0) {
+      this._floorTick = Math.max(this._floorTick, buf[keepFrom - 1].tick);
+      buf.splice(0, keepFrom);
+    }
+    // Hard cap regardless of render time, so a stalled render loop (tab
+    // backgrounded, etc.) can't let the buffer grow without bound.
+    if (buf.length > CFG.SNAP_BUFFER) {
+      const overflow = buf.length - CFG.SNAP_BUFFER;
+      this._floorTick = Math.max(this._floorTick, buf[overflow - 1].tick);
+      buf.splice(0, overflow);
+    }
   },
 
   end(reason) {
@@ -598,7 +700,9 @@ const Client = {
     this.onEnd(reason);
   },
 
-  /** Find the two snapshots bracketing render time. */
+  /** Find the two snapshots bracketing render time, by their tick-derived
+   *  virtual time — the buffer is sorted by tick, so this stays consistent
+   *  even when a packet was reordered in after arriving late. */
   interpolate() {
     const buf = this.buf;
     if (!buf.length) return null;
@@ -606,12 +710,12 @@ const Client = {
 
     let older = buf[0], newer = null;
     for (let i = buf.length - 1; i >= 0; i--) {
-      if (buf[i].recvAt <= at) { older = buf[i]; newer = buf[i + 1] || null; break; }
+      if (buf[i].vt <= at) { older = buf[i]; newer = buf[i + 1] || null; break; }
     }
     if (!newer && buf.length > 1 && older === buf[0]) newer = buf[1];
 
-    const t = (newer && newer.recvAt > older.recvAt)
-      ? Math.max(0, Math.min(1, (at - older.recvAt) / (newer.recvAt - older.recvAt)))
+    const t = (newer && newer.vt > older.vt)
+      ? Math.max(0, Math.min(1, (at - older.vt) / (newer.vt - older.vt)))
       : 0;                                  // hold; never extrapolate
     return { older, newer, t };
   },
@@ -706,7 +810,7 @@ const Client = {
 
 window.Netcode = {
   CFG, BTN, INPUT_MASK, P_FLAG, B_FLAG,
-  Codec, Validate, Host, Client, Tween, JitterTracker,
+  Codec, Validate, Host, Client, Tween, JitterTracker, TickClock,
   buildWorld, makePlayer, dropPlayer, stateToMask, maskToState, PALETTE,
 };
 
