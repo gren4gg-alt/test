@@ -76,6 +76,7 @@
     <button id="joinGo">Go</button>
   </div>
   <div id="code" hidden></div>
+  <button id="startBtn" hidden>Start Game</button>
   <div id="status"></div>
 </div>
 
@@ -246,13 +247,19 @@ $('hostBtn').onclick = () => {
   setStatus('Creating room…');
   peer = new Peer({ debug: 1 });
   peer.on('open', id => {
-    Host.start(peer, input, setStatus, endSession);
+    Host.prepare(peer, setStatus);   // accept connections + let players queue, but don't sim yet
     codeEl.hidden = false;
     codeEl.textContent = id;
-    setStatus('Share this code, then press anything to play.');
-    setTimeout(() => begin(Host), 400);
+    setStatus('Share this code. Players can join now — press Start when ready.');
+    document.getElementById('startBtn').hidden = false;
   });
   peer.on('error', e => setStatus('Peer error: ' + e.type));
+};
+
+$('startBtn').onclick = () => {
+  document.getElementById('startBtn').hidden = true;
+  Host.start(peer, input, setStatus, endSession);   // begins simulating + broadcasting
+  begin(Host);                                       // only now does the host enter the room
 };
 
 /* ---------- join ---------- */
@@ -271,10 +278,15 @@ $('joinGo').onclick = () => {
     const conn = peer.connect(raw, { reliable: false, serialization: 'json' });
     conn.on('open', () => {
       Client.start(conn, input, setStatus, endSession);
-      setStatus('Connected.');
-      begin(Client);
+      setStatus('Connected — waiting for the host to start…');
     });
-    conn.on('data', msg => Client.onData(msg));
+    conn.on('data', msg => {
+      Client.onData(msg);
+      if (msg && msg.type === 'welcome' && !running) {
+        setStatus('Connected.');
+        begin(Client);
+      }
+    });
     conn.on('close', () => endSession('Host ended the session.'));
     conn.on('error', () => setStatus('Connection error.'));
   });
