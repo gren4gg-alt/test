@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duble Trouble — Netcode</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; background:#16161e; color:#e4e4ef; margin:0; padding:20px; }
+  #setup { max-width:460px; margin:0 auto 16px; }
+  h2 { margin:0 0 12px; font-weight:600; }
+  input, button { font:inherit; padding:9px 12px; border-radius:6px; border:1px solid #3a3a4a;
+                  background:#22222c; color:#e4e4ef; box-sizing:border-box; }
+  button { cursor:pointer; background:#2d2d3d; }
+  button:hover { background:#383848; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  #joinForm { display:flex; gap:8px; margin-top:8px; }
+  #joinForm input { flex:2; }
+  #joinForm button { flex:1; }
+  .hidden { display:none !important; }
+  #status { font-size:13px; color:#8b8ba0; margin:10px 0; white-space:pre-wrap; min-height:1.2em; }
+  #code { font:600 20px ui-monospace, monospace; color:#7ee0d0; user-select:all;
+          background:#1d1d28; padding:8px 12px; border-radius:6px; display:inline-block; margin-top:4px; }
+  canvas { display:block; margin:0 auto; background:#0e0e14; border:1px solid #2a2a38; border-radius:8px;
+           max-width:100%; touch-action:none; }
+  #hud { max-width:820px; margin:8px auto 0; font:12px ui-monospace, monospace; color:#6a6a80; }
+</style>
+</head>
+<body>
+
+<div id="setup">
+  <h2>Duble Trouble — Netcode</h2>
+  <div class="row" id="modeButtons">
+    <button id="hostBtn">Host</button>
+    <button id="joinBtn">Join</button>
+  </div>
+  <div id="joinForm" class="hidden">
+    <input id="joinInput" placeholder="Room code" maxlength="64" autocomplete="off" spellcheck="false">
+    <button id="joinGo">Connect</button>
+  </div>
+  <div id="status"></div>
+  <div id="codeWrap"></div>
+</div>
+
+<canvas id="game" width="800" height="500" class="hidden"></canvas>
+<div id="hud"></div>
+
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script>
+"use strict";
+
+/* ===========================================================================
+   CONFIG
+   =========================================================================== */
+const CFG = {
+  SIM_HZ:            60,     // fixed simulation timestep (host + client prediction)
+  SNAPSHOT_HZ:       20,     // authoritative state broadcast rate
+  INPUT_HZ:          60,     // client -> host input send rate (one per sim tick)
+  INTERP_DELAY_MS:   100,    // render remote entities this far behind (~2 snapshots)
+  SNAPSHOT_BUFFER:   32,     // max snapshots retained client-side
+  MAX_PENDING_INPUT: 240,    // max unacked inputs retained for replay (~4s)
+  MAX_PLAYERS:       8,
+  RECONCILE_SNAP_PX: 64,     // divergence above this snaps instead of smoothing
+  RECONCILE_SMOOTH:  0.25,   // fraction of small error corrected per frame
+  WORLD_W:           800,
+  WORLD_H:           500,
+  MOVE_SPEED:        220,    // px/sec
+  // --- security limits ---
+  MAX_MSG_BYTES:     2048,   // reject oversized client messages
+  MAX_MSG_PER_SEC:   180,    // per-connection flood cap (3x expected input rate)
+};
+const SIM_DT   = 1 / CFG.SIM_HZ;
+const SIM_MS   = 1000 / CFG.SIM_HZ;
+const SNAP_MS  = 1000 / CFG.SNAPSHOT_HZ;
+
+const PALETTE = ['#e06c75','#61afef','#98c379','#e5c07b','#c678dd','#56b6c2','#d19a66','#abb2bf'];
+
+// Input bitmask — compact on the wire, trivially validatable.
+const BTN = { LEFT:1, RIGHT:2, UP:4, DOWN:8 };
+const INPUT_MASK = BTN.LEFT | BTN.RIGHT | BTN.UP | BTN.DOWN; // 15
+
+/* ===========================================================================
+   SIMULATION  (the only physics-aware code — swap this whole block later)
+   ---------------------------------------------------------------------------
+   Contract the netcode relies on, and all it relies on:
+     - createEntity(id, slot) -> entity object
+     - step(entity, inputMask, dt)  ... deterministic, no globals, no RNG
+     - SYNC_FIELDS: which entity fields get replicated
+   Adding gravity/jump/collision later = edit `step` + extend SYNC_FIELDS.
+   Nothing in the transport, snapshot, prediction or interpolation layers
+   knows what an entity *is*.
+   =========================================================================== */
+const Sim = {
+  // Replicated fields. Add 'vx','vy','rot','anim' etc. here when physics lands;
+  // encode/decode/interpolate all derive from this list automatically.
+  SYNC_FIELDS: ['x', 'y'],
+  // Fields that should be lerped when interpolating (subset of SYNC_FIELDS).
+  LERP_FIELDS: ['x', 'y'],
+
+  createEntity(id, slot) {
+    return { id, slot, x: 80 + (slot % 4) * 90, y: 80 + Math.floor(slot / 4) * 90 };
+  },
+
+  // Deterministic fixed-step advance. MUST be identical on host and client
+  // or prediction will constantly mispredict.
+  step(e, mask, dt) {
+    let dx = 0, dy = 0;
+    if (mask & BTN.LEFT)  dx -= 1;
+    if (mask & BTN.RIGHT) dx += 1;
+    if (mask & BTN.UP)    dy -= 1;
+    if (mask & BTN.DOWN)  dy += 1;
+    if (dx && dy) { const k = Math.SQRT1_2; dx *= k; dy *= k; } // no diagonal speed boost
+    e.x += dx * CFG.MOVE_SPEED * dt;
+    e.y += dy * CFG.MOVE_SPEED * dt;
+    // Clamp so entities stay on screen. Real collision replaces this.
+    if (e.x < 16) e.x = 16; else if (e.x > CFG.WORLD_W - 16) e.x = CFG.WORLD_W - 16;
+    if (e.y < 16) e.y = 16; else if (e.y > CFG.WORLD_H - 16) e.y = CFG.WORLD_H - 16;
+  },
+};
+
+/* ===========================================================================
+   SNAPSHOT CODEC  (generic — driven entirely by Sim.SYNC_FIELDS)
+   Wire format is a flat array, not {key:value} objects: at 20Hz x 8 players
+   the key names alone would dominate the payload.
+     snapshot = { t: tick, a: ackSeq, e: [slot, f0, f1, ..., slot, f0, f1, ...] }
+   Floats are rounded to whole pixels — sub-pixel precision is invisible and
+   round numbers serialize far smaller over JSON.
+   =========================================================================== */
+const Codec = {
+  encode(entityMap, tick) {
+    const F = Sim.SYNC_FIELDS, flat = [];
+    for (const e of entityMap.values()) {
+      flat.push(e.slot);
+      for (let i = 0; i < F.length; i++) flat.push(Math.round(e[F[i]]));
+    }
+    return { t: tick, e: flat };
+  },
+
+  // Returns Map<slot, {slot, ...fields}> or null if the payload is malformed.
+  decode(snap) {
+    if (!snap || !Array.isArray(snap.e)) return null;
+    const F = Sim.SYNC_FIELDS, stride = F.length + 1, flat = snap.e;
+    if (flat.length % stride !== 0) return null;
+    const out = new Map();
+    for (let i = 0; i < flat.length; i += stride) {
+      const slot = flat[i];
+      if (!Number.isInteger(slot) || slot < 0 || slot >= CFG.MAX_PLAYERS) return null;
+      const ent = { slot };
+      for (let f = 0; f < F.length; f++) {
+        const v = flat[i + 1 + f];
+        if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+        ent[F[f]] = v;
+      }
+      out.set(slot, ent);
+    }
+    return out;
+  },
+};
+
+/* ===========================================================================
+   VALIDATION  (host trusts nothing from the wire)
+   ---------------------------------------------------------------------------
+   Clients send ONLY inputs — never positions. A hostile client can at worst
+   claim to be holding arrow keys, which the host's own sim bounds anyway.
+   =========================================================================== */
+const Validate = {
+  size(msg) {
+    // Cheap guard against memory-exhaustion payloads before we inspect them.
+    try { return JSON.stringify(msg).length <= CFG.MAX_MSG_BYTES; }
+    catch { return false; }              // circular / non-serializable => reject
+  },
+  inputMsg(msg) {
+    if (!msg || msg.type !== 'i') return null;
+    const seq = msg.s, mask = msg.m;
+    if (!Number.isInteger(seq) || seq < 0 || seq > 2 ** 31) return null;
+    if (!Number.isInteger(mask) || mask < 0 || mask > INPUT_MASK) return null;
+    return { seq, mask };               // normalized; unknown bits discarded
+  },
+  roomCode(str) {
+    // PeerJS ids are alphanumeric + dashes. Reject anything else outright so a
+    // pasted string can never be smuggled somewhere it shouldn't go.
+    return typeof str === 'string' && /^[A-Za-z0-9_-]{4,64}$/.test(str.trim());
+  },
+};
+
+// Token-bucket rate limiter, one per connection.
+function makeRateLimiter(perSec) {
+  let tokens = perSec, last = performance.now();
+  return function allow() {
+    const now = performance.now();
+    tokens = Math.min(perSec, tokens + ((now - last) / 1000) * perSec);
+    last = now;
+    if (tokens < 1) return false;
+    tokens -= 1;
+    return true;
+  };
+}
+
+/* ===========================================================================
+   SHARED STATE
+   =========================================================================== */
+let peer = null, isHost = false, running = false;
+let myPeerId = null, mySlot = -1;
+
+const statusEl = document.getElementById('status');
+const codeWrap = document.getElementById('codeWrap');
+const setupEl  = document.getElementById('setup');
+const hudEl    = document.getElementById('hud');
+const canvas   = document.getElementById('game');
+const ctx      = canvas.getContext('2d');
+
+const setStatus = m => { statusEl.textContent = m; };
+
+function startLoop() {
+  canvas.classList.remove('hidden');
+  running = true;
+  requestAnimationFrame(frame);
+}
+
+/* ===========================================================================
+   HOST
+   =========================================================================== */
+const Host = {
+  entities: new Map(),      // peerId -> entity (authoritative)
+  peers:    new Map(),      // peerId -> { conn, inputQueue, lastMask, lastSeq, allow }
+  slots:    new Map(),      // peerId -> slot
+  usedSlots: new Set(),
+  tick: 0,
+  acc: 0,
+  lastTime: 0,
+  snapAcc: 0,
+
+  start() {
+    isHost = true;
+    peer = new Peer({ debug: 1 });
+
+    peer.on('open', id => {
+      myPeerId = id;
+      mySlot = this.claimSlot(id);
+      this.entities.set(id, Sim.createEntity(id, mySlot));
+      // Host is just another input source — no special case in the sim.
+      this.peers.set(id, {
+        conn: null, inputQueue: [], lastMask: 0, lastSeq: 0, ackSeq: 0, allow: () => true,
+      });
+
+      codeWrap.innerHTML = `<div>Room code</div><div id="code">${escapeHtml(id)}</div>`;
+      setStatus('Hosting — waiting for players. Arrow keys to move.');
+      document.getElementById('modeButtons').classList.add('hidden');
+      startLoop();
+
+      this.lastTime = performance.now();
+    });
+
+    peer.on('connection', conn => this.onConnection(conn));
+    peer.on('error', err => setStatus('Peer error: ' + err.type));
+  },
+
+  claimSlot(id) {
+    for (let s = 0; s < CFG.MAX_PLAYERS; s++) {
+      if (!this.usedSlots.has(s)) { this.usedSlots.add(s); this.slots.set(id, s); return s; }
+    }
+    return -1;
+  },
+
+  releaseSlot(id) {
+    const s = this.slots.get(id);
+    if (s !== undefined) { this.usedSlots.delete(s); this.slots.delete(id); }
+  },
+
+  onConnection(conn) {
+    // Reject over capacity before allocating anything for this peer.
+    if (this.peers.size >= CFG.MAX_PLAYERS) {
+      conn.on('open', () => { try { conn.send({ type: 'full' }); } catch {} conn.close(); });
+      return;
+    }
+
+    conn.on('open', () => {
+      if (this.peers.has(conn.peer)) { conn.close(); return; }   // duplicate connection
+      const slot = this.claimSlot(conn.peer);
+      if (slot < 0) { conn.close(); return; }
+
+      this.entities.set(conn.peer, Sim.createEntity(conn.peer, slot));
+      this.peers.set(conn.peer, {
+        conn,
+        inputQueue: [],
+        lastMask: 0,
+        lastSeq: 0,      // highest seq *received* (replay/stale guard)
+        ackSeq: 0,       // highest seq *simulated* (what the client reconciles against)
+        allow: makeRateLimiter(CFG.MAX_MSG_PER_SEC),
+      });
+
+      // Tell the client which slot is theirs, plus sim constants so it can
+      // predict with the same numbers the host uses.
+      conn.send({ type: 'welcome', slot, tick: this.tick });
+      setStatus(`Hosting — ${this.peers.size - 1} client(s) connected.`);
+    });
+
+    conn.on('data', msg => this.onData(conn, msg));
+    conn.on('close', () => this.dropPeer(conn.peer));
+    conn.on('error', () => this.dropPeer(conn.peer));
+  },
+
+  onData(conn, msg) {
+    const p = this.peers.get(conn.peer);
+    if (!p) return;
+    if (!p.allow()) return;                       // flood: silently drop
+    if (!Validate.size(msg)) return;              // oversized: drop
+
+    const input = Validate.inputMsg(msg);
+    if (!input) return;                           // malformed / unknown type: drop
+    if (input.seq <= p.lastSeq) return;           // stale or replayed: drop
+
+    p.lastSeq = input.seq;
+    p.inputQueue.push(input);
+    // Bound the queue so a client that floods slightly under the rate limit
+    // still can't grow host memory without limit.
+    if (p.inputQueue.length > 12) p.inputQueue.splice(0, p.inputQueue.length - 12);
+  },
+
+  dropPeer(id) {
+    this.peers.delete(id);
+    this.entities.delete(id);
+    this.releaseSlot(id);
+    setStatus(`Hosting — ${Math.max(0, this.peers.size - 1)} client(s) connected.`);
+  },
+
+  // One fixed simulation step: consume exactly one queued input per player,
+  // falling back to their last known input if the queue underruns (jitter).
+  step() {
+    for (const [id, p] of this.peers) {
+      const ent = this.entities.get(id);
+      if (!ent) continue;
+      let mask;
+      if (id === myPeerId) {
+        mask = LocalInput.mask;                   // host reads its own keys directly
+      } else if (p.inputQueue.length) {
+        const inp = p.inputQueue.shift();
+        mask = inp.mask;
+        p.lastMask = mask;
+        p.ackSeq = inp.seq;                       // last seq actually simulated
+      } else {
+        mask = p.lastMask;                        // repeat last input on underrun
+      }
+      Sim.step(ent, mask, SIM_DT);
+    }
+    this.tick++;
+  },
+
+  broadcast() {
+    const snap = Codec.encode(this.entities, this.tick);
+    for (const [id, p] of this.peers) {
+      if (!p.conn || !p.conn.open) continue;
+      // Per-client ack so each client knows which of *its* inputs are applied.
+      try { p.conn.send({ type: 's', t: snap.t, e: snap.e, a: p.ackSeq | 0 }); } catch {}
+    }
+  },
+
+  update(now) {
+    let delta = now - this.lastTime;
+    this.lastTime = now;
+    if (delta > 250) delta = 250;                 // don't spiral after a tab stall
+    this.acc += delta;
+    while (this.acc >= SIM_MS) { this.step(); this.acc -= SIM_MS; }
+
+    this.snapAcc += delta;
+    if (this.snapAcc >= SNAP_MS) {
+      this.snapAcc %= SNAP_MS;
+      this.broadcast();
+    }
+  },
+
+  renderList() {
+    // Host is authoritative — render its own state directly, no interpolation.
+    return Array.from(this.entities.values());
+  },
+};
+
+/* ===========================================================================
+   CLIENT
+   =========================================================================== */
+const Client = {
+  conn: null,
+  buffer: [],           // [{ recvAt, tick, entities: Map<slot,ent> }] oldest first
+  predicted: null,      // our own locally-simulated entity
+  pending: [],          // [{seq, mask}] inputs sent but not yet acked
+  seq: 0,
+  acc: 0,
+  lastTime: 0,
+  errX: 0, errY: 0,     // residual reconciliation error, smoothed away visually
+  stats: { gap: 0, lastRecv: 0, replays: 0 },
+
+  start(hostId) {
+    isHost = false;
+    peer = new Peer({ debug: 1 });
+
+    peer.on('open', id => {
+      myPeerId = id;
+      setStatus('Connecting…');
+      // Unreliable+unordered: state snapshots are self-contained, so a dropped
+      // packet should never delay the next one behind a retransmit.
+      this.conn = peer.connect(hostId, { reliable: false, serialization: 'json' });
+
+      this.conn.on('open', () => {
+        setStatus('Connected. Arrow keys to move.');
+        setupEl.classList.add('hidden');
+        this.lastTime = performance.now();
+        startLoop();
+      });
+      this.conn.on('data', msg => this.onData(msg));
+      this.conn.on('close', () => { setStatus('Disconnected from host.'); running = false; });
+      this.conn.on('error', () => setStatus('Connection error.'));
+    });
+
+    peer.on('error', err => {
+      setStatus(err.type === 'peer-unavailable'
+        ? 'No host found with that room code.'
+        : 'Peer error: ' + err.type);
+    });
+  },
+
+  onData(msg) {
+    if (!msg || typeof msg !== 'object') return;
+
+    if (msg.type === 'full') { setStatus('Room is full.'); return; }
+
+    if (msg.type === 'welcome') {
+      if (!Number.isInteger(msg.slot) || msg.slot < 0 || msg.slot >= CFG.MAX_PLAYERS) return;
+      mySlot = msg.slot;
+      this.predicted = Sim.createEntity(myPeerId, mySlot);
+      return;
+    }
+
+    if (msg.type === 's') {
+      const ents = Codec.decode(msg);
+      if (!ents) return;                            // malformed snapshot: ignore
+
+      const now = performance.now();
+      this.stats.gap = this.stats.lastRecv ? now - this.stats.lastRecv : 0;
+      this.stats.lastRecv = now;
+
+      // Timeline uses LOCAL receive time, never the host's clock — the two
+      // machines' clocks are not synchronized and never will be.
+      this.buffer.push({ recvAt: now, tick: msg.t, entities: ents });
+      if (this.buffer.length > CFG.SNAPSHOT_BUFFER) this.buffer.shift();
+
+      this.reconcile(ents, msg.a);
+      return;
+    }
+  },
+
+  // Server reconciliation: adopt the authoritative state for our own entity,
+  // then replay every input the host hasn't acked yet.
+  reconcile(ents, ackSeq) {
+    if (!this.predicted || mySlot < 0) return;
+    const auth = ents.get(mySlot);
+    if (!auth) return;
+
+    const beforeX = this.predicted.x, beforeY = this.predicted.y;
+
+    // Snap to authority...
+    for (const f of Sim.SYNC_FIELDS) this.predicted[f] = auth[f];
+
+    // ...then re-apply inputs the host hasn't processed yet.
+    if (Number.isInteger(ackSeq)) {
+      let i = 0;
+      while (i < this.pending.length && this.pending[i].seq <= ackSeq) i++;
+      if (i) this.pending.splice(0, i);
+    }
+    for (const p of this.pending) Sim.step(this.predicted, p.mask, SIM_DT);
+    this.stats.replays = this.pending.length;
+
+    // Any leftover difference between what we drew last frame and where we
+    // now are gets eased out over the next few frames instead of snapping.
+    const dx = beforeX - this.predicted.x, dy = beforeY - this.predicted.y;
+    if (Math.hypot(dx, dy) < CFG.RECONCILE_SNAP_PX) { this.errX = dx; this.errY = dy; }
+    else { this.errX = 0; this.errY = 0; }        // large desync: snap, don't slide
+  },
+
+  update(now) {
+    let delta = now - this.lastTime;
+    this.lastTime = now;
+    if (delta > 250) delta = 250;
+    this.acc += delta;
+
+    while (this.acc >= SIM_MS) {
+      this.acc -= SIM_MS;
+      if (!this.predicted || !this.conn || !this.conn.open) continue;
+
+      const mask = LocalInput.mask;
+      const seq = ++this.seq;
+
+      // 1. Predict locally — instant feedback, no round trip.
+      Sim.step(this.predicted, mask, SIM_DT);
+      // 2. Remember it so we can replay after the host answers.
+      this.pending.push({ seq, mask });
+      if (this.pending.length > CFG.MAX_PENDING_INPUT) this.pending.shift();
+      // 3. Ship it.
+      try { this.conn.send({ type: 'i', s: seq, m: mask }); } catch {}
+    }
+
+    // Decay the reconciliation error toward zero for smooth visual correction.
+    this.errX *= (1 - CFG.RECONCILE_SMOOTH);
+    this.errY *= (1 - CFG.RECONCILE_SMOOTH);
+    if (Math.abs(this.errX) < 0.05) this.errX = 0;
+    if (Math.abs(this.errY) < 0.05) this.errY = 0;
+  },
+
+  // Remote entities: interpolate between the two snapshots bracketing a render
+  // time held deliberately in the past. We never extrapolate — guessing forward
+  // is what produces overshoot-then-snap when someone stops moving.
+  renderList() {
+    const out = [];
+    const buf = this.buffer;
+
+    if (buf.length) {
+      const renderAt = performance.now() - CFG.INTERP_DELAY_MS;
+      let older = null, newer = null;
+
+      for (let i = buf.length - 1; i >= 0; i--) {
+        if (buf[i].recvAt <= renderAt) { older = buf[i]; newer = buf[i + 1] || null; break; }
+      }
+      if (!older) { older = buf[0]; newer = buf[1] || null; }   // buffer underrun
+
+      const t = (newer && newer.recvAt > older.recvAt)
+        ? clamp((renderAt - older.recvAt) / (newer.recvAt - older.recvAt), 0, 1)
+        : 0;                                                    // hold, never overshoot
+
+      for (const [slot, a] of older.entities) {
+        if (slot === mySlot) continue;                          // ours is predicted
+        const b = newer ? newer.entities.get(slot) : null;
+        const ent = { slot };
+        for (const f of Sim.SYNC_FIELDS) ent[f] = a[f];
+        if (b) for (const f of Sim.LERP_FIELDS) ent[f] = lerp(a[f], b[f], t);
+        out.push(ent);
+      }
+    }
+
+    if (this.predicted) {
+      out.push({
+        slot: mySlot,
+        x: this.predicted.x + this.errX,
+        y: this.predicted.y + this.errY,
+      });
+    }
+    return out;
+  },
+};
+
+/* ===========================================================================
+   INPUT
+   =========================================================================== */
+const LocalInput = {
+  mask: 0,
+  KEYS: {
+    ArrowLeft: BTN.LEFT, ArrowRight: BTN.RIGHT, ArrowUp: BTN.UP, ArrowDown: BTN.DOWN,
+    a: BTN.LEFT, d: BTN.RIGHT, w: BTN.UP, s: BTN.DOWN,
+  },
+  init() {
+    addEventListener('keydown', e => {
+      const b = this.KEYS[e.key];
+      if (b) { this.mask |= b; e.preventDefault(); }
+    });
+    addEventListener('keyup', e => {
+      const b = this.KEYS[e.key];
+      if (b) { this.mask &= ~b; e.preventDefault(); }
+    });
+    // Releasing keys while unfocused otherwise leaves you "stuck" moving.
+    addEventListener('blur', () => { this.mask = 0; });
+  },
+};
+LocalInput.init();
+
+/* ===========================================================================
+   RENDER
+   =========================================================================== */
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+function frame(now) {
+  if (!running) return;
+
+  const side = isHost ? Host : Client;
+  side.update(now);
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const list = side.renderList();
+  for (const e of list) {
+    const isMe = e.slot === mySlot;
+    ctx.fillStyle = PALETTE[e.slot % PALETTE.length];
+    ctx.fillRect(e.x - 16, e.y - 16, 32, 32);
+    if (isMe) {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(e.x - 16, e.y - 16, 32, 32);
+    }
+  }
+
+  // Diagnostics — the numbers that tell you whether sync is actually healthy.
+  if (isHost) {
+    hudEl.textContent =
+      `HOST  players:${Host.peers.size}  tick:${Host.tick}  sim:${CFG.SIM_HZ}Hz  snap:${CFG.SNAPSHOT_HZ}Hz`;
+  } else {
+    const s = Client.stats;
+    const stale = s.lastRecv ? Math.round(performance.now() - s.lastRecv) : 0;
+    hudEl.textContent =
+      `CLIENT  entities:${list.length}  snap gap:${Math.round(s.gap)}ms  ` +
+      `since last:${stale}ms  replaying:${s.replays} inputs  buffer:${Client.buffer.length}`;
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ===========================================================================
+   UI WIRING
+   =========================================================================== */
+document.getElementById('hostBtn').onclick = () => Host.start();
+document.getElementById('joinBtn').onclick = () => {
+  document.getElementById('joinForm').classList.remove('hidden');
+  document.getElementById('joinInput').focus();
+};
+document.getElementById('joinGo').onclick = () => {
+  const raw = document.getElementById('joinInput').value.trim();
+  if (!Validate.roomCode(raw)) { setStatus('That room code doesn\'t look valid.'); return; }
+  document.getElementById('modeButtons').classList.add('hidden');
+  document.getElementById('joinForm').classList.add('hidden');
+  Client.start(raw);
+};
+document.getElementById('joinInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('joinGo').click();
+});
+</script>
+</body>
+</html>
