@@ -597,7 +597,7 @@ const Client = {
   jitter: null, clock: null, _floorTick: -1,
   _sentMask: -1, _sentAt: 0,
   _out: [],
-  stats: { gap: 0, lastRecv: 0, snaps: 0, teleports: 0, reordered: 0, lateDropped: 0 },
+  stats: { gap: 0, lastRecv: 0, snaps: 0, teleports: 0, reordered: 0, lateDropped: 0, instabilityEvents: 0 },
 
   start(conn, input, onStatus, onEnd) {
     this.nw = buildWorld();
@@ -698,6 +698,26 @@ const Client = {
     if (!this.alive) return;
     this.alive = false;
     this.onEnd(reason);
+  },
+
+  /**
+   * Called when the underlying WebRTC connection reports instability
+   * (ICE state moving away from 'connected' — a network path change, a
+   * dropped STUN check, a wifi/cellular handoff). This is a LEADING
+   * indicator: it fires the moment the transport notices trouble, before
+   * that trouble has necessarily shown up as a missed or delayed
+   * snapshot. The JitterTracker's EWMA would eventually widen the delay
+   * on its own once packets actually start arriving late — but "eventually"
+   * means after the stutter has already been visible. Reacting here closes
+   * that gap: widen defensively now, and let the normal per-snapshot
+   * easing (see JitterTracker.sample) settle it back down once conditions
+   * are confirmed stable again, exactly as it would for any other jitter.
+   */
+  flagUnstable() {
+    if (!this.jitter) return;
+    const boosted = Math.min(CFG.INTERP_DELAY_MAX, this.jitter.delay * 1.6 + 40);
+    this.jitter.delay = Math.max(this.jitter.delay, boosted);
+    this.stats.instabilityEvents++;
   },
 
   /** Find the two snapshots bracketing render time, by their tick-derived
