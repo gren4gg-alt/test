@@ -212,7 +212,8 @@ function hud() {
     const stale = s.lastRecv ? Math.round(performance.now() - s.lastRecv) : 0;
     hudEl.textContent =
       `CLIENT slot:${Client.mySlot}  gap:${Math.round(s.gap)}ms  since:${stale}ms  ` +
-      `sim:${s.simMs.toFixed(2)}ms  snaps:${s.snaps}  snaps-corrected:${s.corrections}`;
+      `snaps:${s.snaps}  teleports:${s.teleports}  ` +
+      `${CFG.SNAPSHOT_HZ}Hz snapshots (no prediction)`;
   }
 }
 
