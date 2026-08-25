@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Duble Trouble — Arrow Gap</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#14141c; color:#e6e6f0;
+               font-family: system-ui, -apple-system, sans-serif;
+               -webkit-user-select:none; user-select:none; }
+
+  /* Replaces the old #lobby host/join screen — this page only ever
+     arrives via hand-off from the lobby (see HANDOFF CONTRACT in
+     netcode.js), so there's nothing to host/join here. Just a status
+     line while the session resumes, or an error if there's nothing to
+     resume. */
+  #boot { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+          justify-content:center; gap:10px; padding:24px; z-index:20; background:#14141c;
+          text-align:center; }
+  #boot h1 { margin:0; font-size:20px; font-weight:600; }
+  #bootStatus { font-size:13px; color:#8a8aa0; }
+
+  #ended { position:fixed; inset:0; z-index:30; display:none; flex-direction:column;
+           align-items:center; justify-content:center; gap:16px; background:rgba(20,20,28,.94);
+           text-align:center; padding:24px; }
+  #ended.on { display:flex; }
+  #endedBtn { font:inherit; padding:11px 18px; border-radius:8px; border:1px solid #3a3a4c;
+              background:#242430; color:#e6e6f0; cursor:pointer; }
+
+  #stage { position:fixed; inset:0; display:none; }
+  #stage.on { display:block; }
+  canvas { display:block; width:100%; height:100%; touch-action:none; }
+  #hud { position:fixed; top:6px; left:8px; font:11px ui-monospace, monospace;
+         color:#6a6a80; pointer-events:none; z-index:5; }
+
+  #youAre { position:fixed; top:6px; left:50%; transform:translateX(-50%); z-index:5; display:none;
+            align-items:center; gap:6px; font:12px system-ui, sans-serif;
+            color:#c8c8d8; background:rgba(20,20,28,.6); padding:5px 10px;
+            border-radius:20px; pointer-events:none; }
+  #youAre.on { display:flex; }
+  #youAreSwatch { width:14px; height:14px; border-radius:4px; box-shadow:0 0 0 1px rgba(255,255,255,.25); }
+
+  /* Countdown before play begins. The host's simulation is frozen while
+     this runs (see frame()), so nothing can kill anyone during it. */
+  #countdown { position:fixed; inset:0; z-index:25; display:none;
+               flex-direction:column; align-items:center; justify-content:center;
+               gap:6px; pointer-events:none; background:rgba(14,14,21,.45); }
+  #countdown.on { display:flex; }
+  #cdNum { font:700 92px system-ui, sans-serif; color:#ffe08a;
+           text-shadow:0 4px 24px rgba(0,0,0,.7); line-height:1;
+           animation:cdPop .45s ease-out; }
+  #cdHint { font-size:14px; color:#c8c8d8; }
+  @keyframes cdPop { from { transform:scale(.55); opacity:0 } to { transform:scale(1); opacity:1 } }
+
+  /* Transient centre-screen message (death, restart, someone exited). */
+  #toast { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+           z-index:22; display:none; font:600 22px system-ui, sans-serif;
+           color:#e6e6f0; background:rgba(20,20,28,.82); padding:12px 22px;
+           border-radius:12px; pointer-events:none; text-align:center;
+           border:1px solid #3a3a4c; }
+  #toast.on { display:block; }
+
+  #exitProg { position:fixed; bottom:10px; left:50%; transform:translateX(-50%);
+              z-index:5; display:none; font:12px system-ui, sans-serif; color:#c8c8d8;
+              background:rgba(20,20,28,.6); padding:5px 12px; border-radius:20px;
+              pointer-events:none; }
+  #exitProg.on { display:block; }
+
+  #touch { display:none; position:fixed; inset:auto 0 0 0; z-index:10;
+           padding:0 18px 22px; justify-content:space-between; pointer-events:none; }
+  @media (pointer: coarse) { #touch { display:flex; } }
+  .pad { display:flex; gap:12px; pointer-events:auto; }
+  .tbtn { width:66px; height:66px; border-radius:50%; border:1px solid #45455e;
+          background:rgba(40,40,58,.72); color:#d8d8ea; font-size:20px;
+          display:flex; align-items:center; justify-content:center;
+          backdrop-filter: blur(3px); }
+  .tbtn.pressed { background:rgba(90,90,130,.9); }
+
+  #rotate { position:fixed; inset:0; z-index:40; display:none;
+            flex-direction:column; align-items:center; justify-content:center;
+            gap:14px; background:#14141c; text-align:center; padding:24px; }
+  #rotate span { font-size:44px; }
+  @media (pointer: coarse) and (orientation: portrait) { #rotate { display:flex; } }
+
+  /* ---- voice/settings overlay (top-right, persistent once in-game) ---- */
+  #voiceBar { position:fixed; top:6px; right:8px; z-index:15; display:none;
+              align-items:center; gap:6px; }
+  #voiceBar.on { display:flex; }
+  .vbtn { width:30px; height:30px; border-radius:50%; border:1px solid #45455e;
+          background:rgba(36,36,48,.85); color:#d8d8ea; font-size:14px; cursor:pointer;
+          display:flex; align-items:center; justify-content:center; padding:0; }
+  .vbtn.muted { background:#5a2f36; border-color:#7a3f46; }
+  .vdots { display:flex; gap:4px; }
+  .vdot { width:8px; height:8px; border-radius:50%; background:#3a3a4c; }
+  .vdot.speaking { background:#5fd68a; box-shadow:0 0 4px #5fd68a; }
+
+  #voicePanel { position:fixed; top:44px; right:8px; z-index:15; display:none;
+                flex-direction:column; gap:10px; background:rgba(24,24,32,.95);
+                border:1px solid #3a3a4c; border-radius:10px; padding:12px; width:220px;
+                font-size:13px; }
+  #voicePanel.on { display:flex; }
+  .vrow { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .seg { display:flex; border:1px solid #3a3a4c; border-radius:6px; overflow:hidden; }
+  .seg button { font:inherit; font-size:12px; padding:5px 8px; border:none; background:#242430;
+                color:#e6e6f0; cursor:pointer; }
+  .seg button.active { background:#3a3a5c; }
+  .peerRow { display:flex; align-items:center; gap:6px; }
+  .peerRow input[type=range] { flex:1; }
+  #leaveBtn { font:inherit; padding:8px; border-radius:6px; border:1px solid #5a2f36;
+              background:#3a2226; color:#e6e6f0; cursor:pointer; }
+</style>
+</head>
+<body>
+
+<div id="rotate">
+  <span>&#8635;</span>
+  <div>Rotate your device to landscape</div>
+  <div style="font-size:13px;color:#8a8aa0">This is shared-screen co-op &mdash; it needs the width.</div>
+</div>
+
+<div id="boot">
+  <h1>Duble Trouble</h1>
+  <div id="bootStatus">Resuming session…</div>
+  <button id="soloBtn" type="button" style="display:none;font:inherit;padding:11px 18px;
+    border-radius:8px;border:1px solid #3a3a4c;background:#242430;color:#e6e6f0;cursor:pointer;">
+    Test solo (no lobby)
+  </button>
+</div>
+
+<div id="ended">
+  <div style="font-size:18px;font-weight:600" id="endedMsg">Session ended</div>
+  <button id="endedBtn">Back</button>
+</div>
+
+<div id="stage">
+  <canvas id="game"></canvas>
+</div>
+<div id="hud"></div>
+<div id="countdown"><div id="cdNum">3</div><div id="cdHint">Get ready…</div></div>
+<div id="toast"></div>
+<div id="exitProg"></div>
+<div id="youAre"><span id="youAreSwatch"></span><span>You</span></div>
+
+<div id="voiceBar">
+  <div class="vdots" id="voiceDots"></div>
+  <button class="vbtn" id="selfMuteBtn" type="button" aria-label="Mute microphone">&#127908;</button>
+  <button class="vbtn" id="settingsBtn" type="button" aria-label="Voice settings">&#9881;</button>
+</div>
+<div id="voicePanel">
+  <div class="vrow">
+    <span>Voice mode</span>
+    <div class="seg" id="modeSwitch">
+      <button type="button" data-mode="always">Always on</button>
+      <button type="button" data-mode="ptt">Push (V)</button>
+    </div>
+  </div>
+  <div id="peerList"></div>
+  <button id="leaveBtn" type="button">Leave session</button>
+</div>
+
+<div id="touch">
+  <div class="pad">
+    <div class="tbtn" id="btnLeft">&#9664;</div>
+    <div class="tbtn" id="btnRight">&#9654;</div>
+  </div>
+  <div class="pad">
+    <div class="tbtn" id="btnAction">&#9995;</div>
+    <div class="tbtn" id="btnJump">&#9650;</div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="engine.js"></script>
+<script src="input.js"></script>
+
+<!-- ==========================================================================
+     Level: Arrow Gap — inlined here in place of level.js.
+     Tunables: ARROW_COUNT, ARROW_GAP, ARROW_SPEED, JUMP_GAP.
+     ========================================================================== -->
+<script>
+(function () {
+"use strict";
+
+const { StaticBody, Entity, TriggerZone, ProjectileSpawner } = window.Engine;
+
+const ARROW_COUNT = 12;
+const ARROW_GAP    = 70;
+const ARROW_SPEED  = 70;
+const JUMP_GAP      = 30;
+
+// 'follow' — camera tracks the players (engine.js's Camera, already
+// simulated and synced; this just renders through it). 'whole' — the
+// old behaviour, the entire level letterboxed to fit the window.
+const VIEW_MODE = 'follow';
+
+// Derived from engine.js's PHYSICS, not guessed: JUMP_VELOCITY 560 against
+// GRAVITY 1700 gives ~0.66s of airtime, and MOVE_SPEED 260 carries you
+// ~171px in that time. That's the absolute theoretical maximum from a
+// perfect full-speed running jump, so gaps are held to ~75% of it to stay
+// humanly clearable. Any gap wider than 171 is literally impossible and
+// the level becomes unfinishable — which is exactly what the original
+// 230px chasm was.
+const MAX_JUMP = Math.round((2 * 560 / 1700) * 260);   // 171
+const SAFE_JUMP = Math.round(MAX_JUMP * 0.75);          // 128
+
+const H_ = 540;
+const FLOOR_Y = 440;
+const START_W = 170;
+const GAP_MARGIN = 40;
+const chasmStartX = START_W;
+const arrowsSpanW = (ARROW_COUNT - 1) * ARROW_GAP;
+const chasmEndX = chasmStartX + GAP_MARGIN * 2 + arrowsSpanW;
+const chasmW = chasmEndX - chasmStartX;
+
+// Stepping stones across the chasm, spaced so no single jump exceeds
+// SAFE_JUMP. Count scales with the chasm, so changing ARROW_COUNT or
+// ARROW_GAP can never silently produce an uncrossable gap again.
+const STONE_W = 54;
+const stoneCount = Math.max(0, Math.ceil((chasmW - SAFE_JUMP) / (SAFE_JUMP + STONE_W)));
+// Gap is what must stay jumpable, so solve for it directly: n stones and
+// n+1 equal gaps span the chasm. (Distributing stone CENTRES evenly
+// instead makes the two end gaps a stone-width wider than the inner
+// ones — at 12 arrows that pushed them to 159px, right on the edge of
+// the 171px absolute maximum.)
+const stoneGap = stoneCount > 0 ? (chasmW - stoneCount * STONE_W) / (stoneCount + 1) : 0;
+const stoneXs = [];
+for (let i = 0; i < stoneCount; i++) {
+  stoneXs.push(chasmStartX + stoneGap * (i + 1) + STONE_W * i);
+}
+
+const safeSpaceW = 630;
+const stepW = 80;
+// The second step is deliberately wider than the first: it carries the
+// death orb, and a player who has learned that needs somewhere on the
+// platform to stand that ISN'T under the orb. At the old 80px the
+// platform was barely wider than the player, so there was no "avoid it"
+// option — only "don't come here", which makes the step useless.
+const step2W = 190;
+const step1X = chasmEndX + safeSpaceW + JUMP_GAP;
+const step2X = step1X + stepW + JUMP_GAP;
+const exitX = step2X + step2W + JUMP_GAP;
+
+// ---- Orbs -------------------------------------------------------------
+// Two floating lights above the steps. The first is pure decoration; the
+// second kills on contact. Same size and same bob so they read as a pair
+// and the lethal one has to be learned.
+const ORB_R = 7;                 // radius, px
+const ORB_HOVER = 26;            // height above the platform surface
+// Where along the second step the death orb sits, 0..1 across its width.
+// Kept off-centre so the safe standing room is one contiguous strip
+// rather than two thin slivers either side.
+const DEATH_ORB_T = 0.34;
+const exitPedestalW = 110;
+const LEVEL_W = exitX + exitPedestalW + 40;
+
+const PLATFORM_COLOR = '#4a4a5e';
+const GOAL_COLOR = '#f0c419';
+
+window.Level = {
+  // MUST be the real computed size. Hardcoding a smaller box (e.g. 1000)
+  // doesn't shrink the level — the geometry is still built out to
+  // LEVEL_W — it just makes the renderer and the camera bounds disagree
+  // with where things actually are, which is what cut the exit off the
+  // right-hand edge.
+  WIDTH: LEVEL_W,
+  HEIGHT: H_,
+  VIEW_MODE: VIEW_MODE,
+
+  spawnPoint(slot) {
+    return { x: 40 + (slot % 4) * 30, y: FLOOR_Y - 40 - Math.floor(slot / 4) * 40 };
+  },
+
+  build(world, nw) {
+    world.deathY = H_ + 80;
+
+    // netcode.js's buildWorld() ALWAYS calls enableCamera(), and Camera
+    // defaults every edge to blocking — including the bottom. That bottom
+    // wall is solid, so a player falling into the chasm lands on it and
+    // never reaches deathY: no death, no reset, just standing in mid-air
+    // over the pit. engine.js flags this exact interaction in Camera's
+    // own comments and says to flip blockBottom off per-level when a
+    // level relies on falling to kill. This level does, so: off.
+    // Left/right stay on (they're the co-op screen-lock mechanic).
+    world.cameraOpts = { blockBottom: false };
+
+    const start = new StaticBody(0, FLOOR_Y, START_W, 20);
+    start.color = PLATFORM_COLOR;
+    world.add(start);
+
+    for (let i = 0; i < ARROW_COUNT; i++) {
+      const x = chasmStartX + GAP_MARGIN + i * ARROW_GAP;
+      const dir = (i % 2 === 0) ? 1 : -1;
+      const spawner = new ProjectileSpawner(x, 20, {
+        vx: dir * ARROW_SPEED,
+        vy: ARROW_SPEED * (40 / 70),
+        gravity: null,        // world default gravity -> natural arc
+        // 'onLand' rather than the default 'bounds': with 'bounds' an
+        // arrow that hits a stone (or a player) freezes in place and
+        // hangs there until it leaves the level, which is why spent
+        // arrows were piling up on screen. 'onLand' despawns them the
+        // moment they connect — engine.js's projectile pass only
+        // despawns-on-kill for this rule.
+        despawn: 'onLand',
+        interval: 1.6,
+        phase: (i % 2) * 0.8,
+        // MUST match netcode.js TYPE_REGISTRY's projectile makeLocal
+        // (w:8, h:20) — the client materializes projectiles from that
+        // placeholder, not from anything sent over the wire, so a
+        // different size here would render correctly on the host and
+        // wrong on every client.
+        w: 8, h: 20,
+        color: '#e8d5a0',
+        kind: 'arrow',
+      });
+      world.add(spawner);
+      nw.spawners.push(spawner);
+    }
+
+    const safe = new StaticBody(chasmEndX, FLOOR_Y, safeSpaceW, 20);
+    safe.color = PLATFORM_COLOR;
+    world.add(safe);
+
+    // Stepping stones inside the chasm — the crossing the arrows are
+    // meant to threaten. Without these the gap was 230px against a 171px
+    // maximum jump, so nobody ever got close enough to be hit.
+    for (const sx of stoneXs) {
+      const stone = new StaticBody(sx, FLOOR_Y, STONE_W, 16);
+      stone.color = '#565672';
+      world.add(stone);
+    }
+
+    const step1 = new StaticBody(step1X, FLOOR_Y - 60, stepW, 16);
+    step1.color = PLATFORM_COLOR;
+    world.add(step1);
+    const step2 = new StaticBody(step2X, FLOOR_Y - 60, step2W, 16);
+    step2.color = PLATFORM_COLOR;
+    world.add(step2);
+
+    // Orb 1 — decorative. solid:false and it never moves, so it needs no
+    // nw array and costs no bandwidth; it just renders.
+    const orb1 = new Entity(step1X + stepW / 2 - ORB_R, FLOOR_Y - 60 - ORB_HOVER - ORB_R,
+                            ORB_R * 2, ORB_R * 2);
+    orb1.solid = false;
+    orb1.kind = 'orb';
+    orb1.color = '#8f8fc8';
+    world.add(orb1);
+
+    // Orb 2 — lethal. The kill is a TriggerZone (effect:'kill'), the only
+    // static kill primitive that's reliably synced: it goes in
+    // nw.triggers and its position never moves, so host and clients agree
+    // for free. Killing a player ticks world.resetGeneration, which is
+    // the same path an arrow hit already uses — so touching this restarts
+    // the level with no extra netcode.
+    const orb2X = step2X + step2W * DEATH_ORB_T - ORB_R;
+    const orb2Y = FLOOR_Y - 60 - ORB_HOVER - ORB_R;
+    const deathOrb = new TriggerZone(orb2X, orb2Y, ORB_R * 2, ORB_R * 2,
+                                     { effect: 'kill', kind: 'death-orb' });
+    deathOrb.color = '#d94f4f';
+    world.add(deathOrb);
+    nw.triggers.push(deathOrb);
+
+    const pedestal = new StaticBody(exitX, FLOOR_Y - 60, exitPedestalW, 16);
+    pedestal.color = PLATFORM_COLOR;
+    world.add(pedestal);
+
+    const goal = new TriggerZone(exitX + 10, FLOOR_Y - 110, 80, 50, { effect: 'goal', kind: 'exit' });
+    goal.color = GOAL_COLOR;
+    world.add(goal); nw.triggers.push(goal);
+    // 'each': a player touching the exit goes through it and is removed
+    // from the room; the level completes once everyone has been through.
+    nw.winCondition = { type: 'reach-goal', mode: 'each', goals: [goal] };
+
+  },
+};
+
+})();
+</script>
+
+<script src="netcode.js"></script>
+<script src="character.js"></script>
+<script src="progress.js"></script>
+<script src="levels.js"></script>
+<script src="voicechat.js"></script>
+<script src="voicechat-adapter.js"></script>
+
+<script>
+"use strict";
+(function () {
+
+const { Host, Client, CFG, PALETTE } = window.Netcode;
+const { Box, Player } = window.Engine;
+
+const $ = id => document.getElementById(id);
+
+// Where "back to lobby" goes. Relative to this page — adjust if level
+// pages ever move into a subfolder relative to the lobby.
+const LOBBY_URL = 'lobby.html';
+const boot = $('boot'), bootStatus = $('bootStatus'), stage = $('stage'),
+      hudEl = $('hud'), canvas = $('game');
+const ctx = canvas.getContext('2d');
+
+const setStatus = m => { bootStatus.textContent = m; };
+
+const input = new window.InputManager();
+window.bindTouchButton($('btnLeft'),   input, 'left');
+window.bindTouchButton($('btnRight'),  input, 'right');
+window.bindTouchButton($('btnJump'),   input, 'jump');
+window.bindTouchButton($('btnAction'), input, 'action');
+
+let side = null, peer = null, running = false, myPeerId = null;
+
+const animStates = new WeakMap();
+let lastFrameAt = performance.now();
+
+let scale = 1, offX = 0, offY = 0;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cw = window.innerWidth, ch = window.innerHeight;
+  canvas.width = cw * dpr; canvas.height = ch * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+/* ---------- view rect ----------
+   The region of level-space the window shows. In 'whole' mode that's the
+   entire level (the original letterbox behaviour). In 'follow' mode it's
+   engine.js's Camera, which already tracks the average of the live
+   players and is clamped to levelBounds — it was being simulated and
+   synced all along (nw.cameras[0], a static-lifecycle entry in netcode's
+   TYPE_REGISTRY with blended x/y), it just was never rendered through.
+   Reading it rather than recomputing a follow point locally means host
+   and clients frame the shot identically, and the camera's collision
+   walls line up with what you can actually see. */
+function viewRect() {
+  if (window.Level.VIEW_MODE === 'follow' && side && side.nw &&
+      side.nw.cameras && side.nw.cameras[0]) {
+    const c = side.nw.cameras[0];
+    return { x: c.x, y: c.y, w: c.w, h: c.h };
+  }
+  return { x: 0, y: 0, w: window.Level.WIDTH, h: window.Level.HEIGHT };
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 100));
+
+// Previous on-screen position per entity, so an arrow's heading can be
+// derived from its actual movement. Clients never receive velocity (see
+// netcode.js's Codec), so this is the only way to know which way a
+// projectile is pointing there — same technique character.js already
+// uses for its own velocity fallback. WeakMap so despawned projectiles
+// clean themselves up.
+const lastPos = new WeakMap();
+
+function roundRect(x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x,     y + h, rr);
+  ctx.arcTo(x,     y + h, x,     y,     rr);
+  ctx.arcTo(x,     y,     x + w, y,     rr);
+  ctx.closePath();
+}
+
+// A real arrow: shaft + head + fletching, rotated to face its heading.
+function drawArrow(x, y, w, h, angle) {
+  const cx = x + w / 2, cy = y + h / 2;
+  const len = Math.max(w, h);
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(angle);
+
+  // shaft
+  ctx.strokeStyle = '#c9a227';
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(-len / 2, 0);
+  ctx.lineTo(len / 2 - 5, 0);
+  ctx.stroke();
+
+  // head
+  ctx.fillStyle = '#ffe08a';
+  ctx.beginPath();
+  ctx.moveTo(len / 2, 0);
+  ctx.lineTo(len / 2 - 7, -4.5);
+  ctx.lineTo(len / 2 - 7, 4.5);
+  ctx.closePath();
+  ctx.fill();
+
+  // fletching
+  ctx.strokeStyle = '#e2554f';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-len / 2, 0);      ctx.lineTo(-len / 2 + 6, -4);
+  ctx.moveTo(-len / 2, 0);      ctx.lineTo(-len / 2 + 6, 4);
+  ctx.moveTo(-len / 2 + 3, 0);  ctx.lineTo(-len / 2 + 9, -4);
+  ctx.moveTo(-len / 2 + 3, 0);  ctx.lineTo(-len / 2 + 9, 4);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function draw() {
+  const now = performance.now();
+  const animDt = Math.min(0.05, (now - lastFrameAt) / 1000);
+  lastFrameAt = now;
+  const t = now / 1000;
+
+  const W = window.Level.WIDTH, H = window.Level.HEIGHT;
+  const view = viewRect();
+  const cw = window.innerWidth, ch = window.innerHeight;
+  // Fill the window in follow mode (max, so no letterbox bars around a
+  // small camera rect); fit the whole thing in whole-level mode (min).
+  scale = window.Level.VIEW_MODE === 'follow'
+    ? Math.max(cw / view.w, ch / view.h)
+    : Math.min(cw / view.w, ch / view.h);
+  offX = (cw - view.w * scale) / 2;
+  offY = (ch - view.h * scale) / 2;
+
+  ctx.save();
+  ctx.setTransform(canvas.width / cw, 0, 0, canvas.height / ch, 0, 0);
+  ctx.fillStyle = '#0e0e15';
+  ctx.fillRect(0, 0, cw, ch);
+  ctx.translate(offX, offY);
+  ctx.scale(scale, scale);
+  ctx.translate(-view.x, -view.y);
+
+  // --- backdrop: vertical gradient + static starfield + far hills ---
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0,   '#1b1b2e');
+  sky.addColorStop(0.6, '#191926');
+  sky.addColorStop(1,   '#12121a');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  // Deterministic pseudo-stars (no Math.random — purely visual, but a
+  // stable field looks intentional and doesn't shimmer frame to frame).
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  for (let i = 0; i < 60; i++) {
+    const sx = (i * 137.5) % W;
+    const sy = (i * 61.7) % (H * 0.55);
+    const tw = 0.6 + 0.4 * Math.sin(t * 1.5 + i);
+    ctx.globalAlpha = 0.18 * tw;
+    ctx.fillRect(sx, sy, 1.6, 1.6);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = '#15151f';
+  ctx.beginPath();
+  ctx.moveTo(0, H);
+  for (let x = 0; x <= W; x += 40) {
+    ctx.lineTo(x, H - 120 - 30 * Math.sin(x * 0.006) - 18 * Math.sin(x * 0.017));
+  }
+  ctx.lineTo(W, H);
+  ctx.closePath();
+  ctx.fill();
+
+  const list = side.renderList();
+
+  for (let i = 0; i < list.length; i++) {
+    const e = list[i].entity;
+    if (!e.isWindZone) continue;
+    ctx.fillStyle = e.color;
+    ctx.fillRect(list[i].x, list[i].y, e.w, e.h);
+  }
+
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i], e = it.entity;
+    if (e.isWindZone) continue;
+    // Camera boundary walls are invisible collision helpers, not scenery
+    // (engine.js sets isCameraWall on them) — drawing them is what put
+    // those stray rectangles on screen.
+    if (e.isCameraWall) continue;
+    const x = it.x, y = it.y;
+
+    if (e instanceof Player) {
+      let anim = animStates.get(e);
+      if (!anim) { anim = window.Character.createAnimState(); animStates.set(e, anim); }
+      const vx = (side === Host) ? e.vx : undefined;
+      const vy = (side === Host) ? e.vy : undefined;
+      // engine.js sets `dead` on the player and syncs it (see Player's
+      // snapshot contract) — character.js has a dead pose, so pass the
+      // real flag through rather than a hardcoded false.
+      window.Character.update(anim, animDt, {
+        x, y, vx, vy, facing: e.facing, grounded: e.grounded, dead: !!e.dead,
+      });
+      window.Character.draw(ctx, anim, { x, y, w: e.w, h: e.h, color: e.color });
+
+    } else if (e.isProjectile || e.kind === 'arrow') {
+      const prev = lastPos.get(e);
+      let angle = Math.PI / 2; // falling straight down until we have a delta
+      if (prev) {
+        const dx = x - prev.x, dy = y - prev.y;
+        if (dx * dx + dy * dy > 0.01) angle = Math.atan2(dy, dx);
+        else if (prev.angle !== undefined) angle = prev.angle;
+      }
+      lastPos.set(e, { x, y, angle });
+      drawArrow(x, y, e.w, e.h, angle);
+
+    } else if (e.kind === 'death-orb') {
+      // Drawn as a sibling of the decorative orb (same size, same bob) so
+      // it doesn't announce itself as a hazard from across the level —
+      // only the colour differs, and you have to get close to read it.
+      // Host and client both run this Level.build(), so `kind` is set
+      // locally on both sides and this branch is reached identically.
+      const cx = x + e.w / 2, cy = y + e.h / 2 + 3 * Math.sin(t * 2 + x * 0.05);
+      const pulse = 0.5 + 0.5 * Math.sin(t * 3.4);
+      ctx.save();
+      ctx.shadowColor = 'rgba(217,79,79,0.9)';
+      ctx.shadowBlur = 10 + 10 * pulse;
+      ctx.fillStyle = 'rgba(217,79,79,' + (0.6 + 0.35 * pulse) + ')';
+      ctx.beginPath(); ctx.arc(cx, cy, e.w / 2, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255,220,220,0.85)';
+      ctx.beginPath(); ctx.arc(cx, cy, e.w / 5, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+
+    } else if (e.isTriggerZone || e.kind === 'exit') {
+      // Goal: pulsing glow + chevron, so it reads as "the thing to reach"
+      // rather than a yellow rectangle.
+      const pulse = 0.5 + 0.5 * Math.sin(t * 2.4);
+      ctx.save();
+      ctx.shadowColor = 'rgba(240,196,25,0.9)';
+      ctx.shadowBlur = 14 + 10 * pulse;
+      ctx.fillStyle = 'rgba(240,196,25,' + (0.16 + 0.12 * pulse) + ')';
+      roundRect(x, y, e.w, e.h, 6); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = 'rgba(255,224,138,' + (0.55 + 0.35 * pulse) + ')';
+      ctx.lineWidth = 2;
+      roundRect(x, y, e.w, e.h, 6); ctx.stroke();
+
+      const cx = x + e.w / 2, cy = y + e.h / 2;
+      const bob = 3 * Math.sin(t * 2.4);
+      ctx.strokeStyle = 'rgba(255,236,180,0.95)';
+      ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(cx - 9, cy + 4 + bob);
+      ctx.lineTo(cx,     cy - 5 + bob);
+      ctx.lineTo(cx + 9, cy + 4 + bob);
+      ctx.stroke();
+      ctx.restore();
+
+    } else if (e.solid === false) {
+      // Small decorative markers — soft dot instead of a hard square.
+      ctx.save();
+      ctx.globalAlpha = 0.5 + 0.3 * Math.sin(t * 2 + x * 0.05);
+      ctx.fillStyle = e.color;
+      ctx.beginPath();
+      ctx.arc(x + e.w / 2, y + e.h / 2, e.w / 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+    } else {
+      // Platforms: body, lit top edge, subtle grounding shadow beneath.
+      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      roundRect(x + 2, y + 4, e.w, e.h, 4); ctx.fill();
+      ctx.fillStyle = e.color || '#4a4a5e';
+      roundRect(x, y, e.w, e.h, 4); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.16)';
+      roundRect(x + 2, y + 1.5, e.w - 4, 3, 1.5); ctx.fill();
+    }
+
+    if (e instanceof Box && e.carried) {
+      ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1.5;
+      ctx.strokeRect(x + 1, y + 1, e.w - 2, e.h - 2);
+    }
+  }
+  ctx.restore();
+}
+
+function mySlot() { return side === Host ? Host.mySlot : Client.mySlot; }
+
+function hud() {
+  if (side === Host) {
+    hudEl.textContent =
+      `HOST players:${Host.nw.players.size}  tick:${Host.tick}  ` +
+      `steps:${Host.stats.steps}  sim:${Host.stats.simMs.toFixed(2)}ms  ` +
+      `${CFG.SIM_HZ}Hz sim / ${CFG.SNAPSHOT_HZ}Hz net`;
+  } else {
+    const s = Client.stats;
+    const stale = s.lastRecv ? Math.round(performance.now() - s.lastRecv) : 0;
+    hudEl.textContent =
+      `CLIENT slot:${Client.mySlot}  gap:${Math.round(s.gap)}ms  since:${stale}ms  ` +
+      `snaps:${s.snaps}  teleports:${s.teleports}`;
+  }
+}
+
+/* ---------- countdown ----------
+   Implemented by simply NOT calling side.update(now) until it expires.
+   On the host that freezes the whole simulation — no gravity, no arrows,
+   no snapshots go out — so there is no way to die during the countdown
+   and no need to separately gate input. Clients are frozen for the same
+   reason: with no snapshots arriving there is nothing to advance to.
+   That's why this is safe to run locally on each side without syncing
+   the countdown itself over the wire. */
+const COUNTDOWN_SECS = 3;
+let countdownEndsAt = 0;
+
+function startCountdown() {
+  countdownEndsAt = performance.now() + COUNTDOWN_SECS * 1000;
+  $('countdown').classList.add('on');
+}
+
+function tickCountdown(now) {
+  if (!countdownEndsAt) return false;
+  const left = countdownEndsAt - now;
+  if (left <= 0) {
+    countdownEndsAt = 0;
+    $('countdown').classList.remove('on');
+    showToast('GO!', 700);
+    return false;
+  }
+  const secs = Math.ceil(left / 1000);
+  const el = $('cdNum');
+  const label = secs <= 0 ? 'GO' : String(secs);
+  if (el.textContent !== label) {
+    el.textContent = label;
+    // Re-trigger the pop animation on each new number.
+    el.style.animation = 'none';
+    void el.offsetWidth;
+    el.style.animation = '';
+  }
+  return true;
+}
+
+/* ---------- transient messages ---------- */
+let toastTimer = null;
+function showToast(msg, ms) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('on'), ms || 1400);
+}
+
+/* ---------- death / restart + exit feedback ----------
+   Both are derived from state that's already synced, so they work
+   identically on host and client without new messages: `dead` is part of
+   the player snapshot, and a player vanishing from the world is how
+   'each' mode removes someone who went through the portal. */
+let wasDead = false;
+let lastPlayerCount = -1;
+let peakPlayerCount = 0;
+let lastResetGen = -1;
+
+function updateFeedback() {
+  const slot = mySlot();
+  const players = side === Host ? side.nw.players
+                                : (Client.nw ? Client.nw.players : null);
+  if (!players) return;
+
+  const me = players.get(slot);
+  const dead = !!(me && me.dead);
+  if (dead && !wasDead) showToast('Hit! Restarting…', 1500);
+  wasDead = dead;
+
+  // Exit progress. peakPlayerCount is the high-water mark rather than a
+  // fixed total, because a level page can be joined mid-session and the
+  // authoritative room size isn't exposed to clients — the number of
+  // players ever seen at once is the closest honest stand-in.
+  const n = players.size;
+  if (n > peakPlayerCount) peakPlayerCount = n;
+  if (n !== lastPlayerCount) {
+    if (lastPlayerCount >= 0 && n < lastPlayerCount && me) {
+      showToast('A player made it through!', 1200);
+    }
+    lastPlayerCount = n;
+  }
+  const out = Math.max(0, peakPlayerCount - n);
+  const prog = $('exitProg');
+  if (peakPlayerCount > 1) {
+    prog.textContent = out + ' / ' + peakPlayerCount + ' through the portal';
+    prog.classList.add('on');
+  } else {
+    prog.classList.remove('on');
+  }
+
+  // A player leaving can force the level to restart (netcode's 'each'
+  // mode won't hand out a win nobody earned — see Host.drop). That comes
+  // through as the world's reset generation ticking over while nobody
+  // died, so it needs its own message rather than the "Hit!" one.
+  const gen = side === Host ? side.nw.world.resetGeneration : Client.resetGen;
+  if (typeof gen === 'number') {
+    if (lastResetGen >= 0 && gen !== lastResetGen && !dead) {
+      // Everyone reappearing at once means the room was rebuilt, not that
+      // one person respawned.
+      if (n > lastPlayerCount) showToast('A player left — restarting.', 1800);
+      peakPlayerCount = n;
+    }
+    lastResetGen = gen;
+  }
+}
+
+function frame(now) {
+  if (!running) return;
+  const counting = tickCountdown(now);
+  if (!counting) {
+    side.update(now);
+    updateFeedback();
+  }
+  draw();
+  hud();
+  requestAnimationFrame(frame);
+}
+
+function endSession(reason) {
+  running = false;
+  clearInterval(voiceHeartbeat);
+  $('endedMsg').textContent = reason || 'Session ended';
+  $('ended').classList.add('on');
+  try { if (peer && !peer.destroyed) peer.destroy(); } catch (e) {}
+}
+// Reload starts clean. Without clearing this, a reload after finishing
+// would try to resume the session we just wrote for the hand-off — and
+// on the 'done' branch that snapshot is intentionally null, which the
+// resume path can't rebuild a room from.
+$('endedBtn').onclick = () => {
+  try { sessionStorage.removeItem('dt-session'); } catch (e) {}
+  location.reload();
+};
+
+// --- level-complete hand-off ---
+// Per the HANDOFF CONTRACT (netcode.js), this writes sessionStorage
+// correctly for whichever role we are, then SHOULD navigate to
+// LEVELS[msg.next].url — but that manifest (index -> URL) is owned by
+// lobby.js, which this file doesn't have. Flagging rather than
+// guessing a URL: session state is written correctly so the actual
+// navigation line is a one-line addition once the manifest exists.
+function onLevelComplete(msg) {
+  running = false;
+  $('exitProg').classList.remove('on');
+
+  // Credit the local device for this level before going anywhere — it's
+  // what unlocks the next tile in the lobby grid on this browser.
+  try { if (window.Progress) window.Progress.markComplete(msg.level); } catch (e) {}
+
+  try {
+    const payload = (side === Host)
+      ? { role: 'host', roomCode: Host.selfId,
+          hostSnapshot: msg.done ? null : Host.snapshot(msg.next) }
+      : { role: 'client', roomCode: Client.conn.peer,
+          token: Client.myToken, level: msg.next };
+    if (msg.done) { sessionStorage.removeItem('dt-session'); }
+    else { sessionStorage.setItem('dt-session', JSON.stringify(payload)); }
+  } catch (e) { console.error('[handoff] failed to persist session', e); }
+
+  // Host only: detach the pagehide 'bye' broadcast BEFORE navigating, or
+  // every client is told the session ended a split second before they
+  // were going to follow us to the same page.
+  if (side === Host) Host.prepareHandoff();
+
+  if (msg.done) {
+    $('endedMsg').textContent = 'All levels complete — nice work!';
+    $('endedBtn').textContent = 'Back to lobby';
+    $('ended').classList.add('on');
+    $('endedBtn').onclick = () => { location.href = LOBBY_URL; };
+    return;
+  }
+
+  let url = null;
+  try { url = window.Levels.urlFor(msg.next); } catch (e) {}
+  if (!url) {
+    $('endedMsg').textContent = 'Level complete — but level ' + msg.next + ' has no page in levels.js.';
+    $('endedBtn').textContent = 'Back to lobby';
+    $('ended').classList.add('on');
+    $('endedBtn').onclick = () => { location.href = LOBBY_URL; };
+    return;
+  }
+
+  showToast('Level complete!', 1200);
+  setTimeout(() => { location.href = url; }, 1000);
+}
+
+function begin(which) {
+  side = which;
+  boot.style.display = 'none';
+  stage.classList.add('on');
+  resize();
+  running = true;
+
+  const slot = mySlot();
+  if (slot >= 0) {
+    $('youAreSwatch').style.background = PALETTE[slot % PALETTE.length];
+    $('youAre').classList.add('on');
+  }
+
+  initVoice();
+  startCountdown();
+  requestAnimationFrame(frame);
+}
+
+// --- voice/settings UI, backed by voicechat-adapter.js's VoiceUI ---
+let voiceHeartbeat = null;
+
+function currentRoster() {
+  // Both sides now get the full room list, so voice is a true mesh:
+  // the host reads its own peer map; a client reads the roster the host
+  // pushes down (folded into 'welcome' on join/rejoin, re-sent on every
+  // membership change — see VOICE ROSTER in netcode.js). Game traffic is
+  // still star-only; these ids are used solely to place voice calls.
+  if (side === Host) return Host.rosterIds();
+  return (Client.roster && Client.roster.length) ? Client.roster
+                                                  : [Client.conn.peer, myPeerId];
+}
+
+function renderVoicePanel() {
+  if (!window.VoiceUI || !window.VoiceUI.isSupported()) return;
+  const V = window.VoiceUI;
+
+  $('selfMuteBtn').classList.toggle('muted', V.isSelfMuted());
+
+  const mode = V.getMode();
+  for (const btn of $('modeSwitch').children) {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  }
+
+  const dotsEl = $('voiceDots');
+  dotsEl.innerHTML = '';
+  const peerListEl = $('peerList');
+  peerListEl.innerHTML = '';
+  for (const id of currentRoster()) {
+    if (id === myPeerId) continue;
+    const dot = document.createElement('div');
+    dot.className = 'vdot' + (V.isPeerSpeaking(id) ? ' speaking' : '');
+    dotsEl.appendChild(dot);
+
+    const row = document.createElement('div');
+    row.className = 'peerRow';
+    const muteBtn = document.createElement('button');
+    muteBtn.className = 'vbtn';
+    muteBtn.style.width = '22px'; muteBtn.style.height = '22px'; muteBtn.style.fontSize = '11px';
+    muteBtn.textContent = V.isPeerLocallyMuted(id) ? '🔇' : '🔊';
+    muteBtn.onclick = () => V.togglePeerMute(id);
+    const vol = document.createElement('input');
+    vol.type = 'range'; vol.min = 0; vol.max = 100; vol.value = Math.round(V.getPeerVolume(id) * 100);
+    vol.oninput = () => V.setPeerVolume(id, vol.value / 100);
+    row.append(muteBtn, vol);
+    peerListEl.appendChild(row);
+  }
+}
+
+async function initVoice() {
+  if (!window.VoiceUI || !window.VoiceUI.isSupported()) return;
+  await window.VoiceUI.init(peer, { onSpeakingChange: renderVoicePanel, onPeerConnected: renderVoicePanel, onPeerDisconnected: renderVoicePanel });
+  $('voiceBar').classList.add('on');
+
+  // Re-mesh the moment membership changes, rather than waiting up to a
+  // full heartbeat. Both sides expose the same hook.
+  const onRosterChange = () => {
+    window.VoiceUI.sync(currentRoster(), myPeerId);
+    renderVoicePanel();
+  };
+  if (side === Host) Host.onRoster = onRosterChange;
+  else Client.onRoster = onRosterChange;
+
+  // Heartbeat stays as the self-healing backstop: sync() is idempotent,
+  // so a roster message lost on the unreliable channel costs a couple of
+  // seconds of missing voice rather than a permanently broken call.
+  voiceHeartbeat = setInterval(() => {
+    window.VoiceUI.sync(currentRoster(), myPeerId);
+  }, 2000);
+  window.VoiceUI.sync(currentRoster(), myPeerId);
+  window.VoiceUI.onChange(renderVoicePanel);
+  renderVoicePanel();
+}
+
+$('selfMuteBtn').onclick = () => window.VoiceUI && window.VoiceUI.toggleSelfMute();
+$('settingsBtn').onclick = () => $('voicePanel').classList.toggle('on');
+for (const btn of $('modeSwitch').children) {
+  btn.onclick = () => window.VoiceUI && window.VoiceUI.setMode(btn.dataset.mode);
+}
+$('leaveBtn').onclick = () => {
+  try { sessionStorage.removeItem('dt-session'); } catch (e) {}
+  if (side === Host) { try { Host.shutdown(); } catch (e) {} }
+  else { try { Client.end('You left.'); } catch (e) {} }
+  endSession('You left the session.');
+};
+
+// PeerJS's signalling server connection can drop without the existing
+// WebRTC data channels dying — established play continues fine, but no
+// NEW peer can find us until it's back. Reconnecting keeps the room
+// joinable instead of silently going dark.
+function wirePeerRecovery() {
+  if (!peer) return;
+  peer.on('disconnected', () => {
+    if (!peer || peer.destroyed) return;
+    showToast('Reconnecting…', 1200);
+    try { peer.reconnect(); } catch (e) {}
+  });
+}
+
+// --- solo test path (no lobby exists yet to hand this off from) ---
+// Uses an AUTO-ASSIGNED peer id (never a fixed room code), so it can
+// never collide with a leftover id from a previous test run — that's
+// what "ID taken" was: a stale registration of a FIXED id (the room
+// code) from a prior session that hadn't cleared yet. This path doesn't
+// need a fixed id at all since nobody else is joining.
+function startSolo() {
+  setStatus('Starting solo test…');
+  peer = new Peer({ debug: 1 });
+  peer.on('open', id => {
+    myPeerId = id;
+    Host.prepare(peer, setStatus, { totalLevels: 1, onComplete: onLevelComplete });
+    Host.lock(0);
+    Host.start(peer, input, setStatus, endSession);
+    begin(Host);
+  });
+  wirePeerRecovery();
+  peer.on('error', e => setStatus('Peer error: ' + e.type));
+}
+$('soloBtn').onclick = startSolo;
+
+// --- entry: resume-only, per HANDOFF CONTRACT item 5. No host/join UI
+// here — this page is only ever reached via hand-off from the lobby.
+// Solo test button is the escape hatch until a real lobby exists. ---
+function bootFromSession() {
+  let sess = null;
+  try { sess = JSON.parse(sessionStorage.getItem('dt-session') || 'null'); } catch (e) {}
+
+  if (!sess) {
+    setStatus('No session found.');
+    $('soloBtn').style.display = 'inline-block';
+    return;
+  }
+
+  if (sess.role === 'host') {
+    if (!sess.hostSnapshot || !sess.hostSnapshot.roomCode) {
+      // Written by a 'done' hand-off, or storage got mangled. Nothing to
+      // rebuild a room from, so offer the clean path rather than throwing
+      // deep inside restore().
+      setStatus('That session has already finished.');
+      $('soloBtn').style.display = 'inline-block';
+      return;
+    }
+    setStatus('Reconnecting as host…');
+    peer = new Peer(sess.roomCode, { debug: 1 });
+    peer.on('open', id => {
+      myPeerId = id;
+      Host.restore(peer, sess.hostSnapshot, input, setStatus, endSession, onLevelComplete);
+      begin(Host);
+    });
+    wirePeerRecovery();
+    peer.on('error', e => {
+      if (e.type === 'unavailable-id') {
+        setStatus('Room code "' + sess.roomCode + '" is still registered from a previous session ' +
+                   '(close any other tabs using it, or wait a moment and reload).');
+      } else {
+        setStatus('Peer error: ' + e.type);
+      }
+    });
+  } else if (sess.role === 'client') {
+    setStatus('Reconnecting…');
+    peer = new Peer({ debug: 1 });
+    peer.on('open', id => {
+      myPeerId = id;
+      const conn = peer.connect(sess.roomCode, { reliable: false, serialization: 'json' });
+      conn.on('open', () => {
+        Client.rejoin(conn, sess.token, input, setStatus, endSession, onLevelComplete);
+        // Early warning of a degrading path — Client widens its
+        // interpolation buffer rather than stuttering once packets
+        // actually start arriving late.
+        const pc = conn.peerConnection;
+        if (pc) {
+          pc.addEventListener('iceconnectionstatechange', () => {
+            const st = pc.iceConnectionState;
+            if (st === 'disconnected' || st === 'failed') Client.flagUnstable();
+          });
+        }
+      });
+      conn.on('data', msg => {
+        Client.onData(msg);
+        if (msg && msg.type === 'welcome' && !running) begin(Client);
+      });
+      conn.on('close', () => endSession('Host ended the session.'));
+      conn.on('error', () => setStatus('Connection error.'));
+    });
+    wirePeerRecovery();
+    peer.on('error', e => {
+      setStatus(e.type === 'peer-unavailable'
+        ? 'The host is no longer hosting that room.'
+        : 'Peer error: ' + e.type);
+    });
+  } else {
+    setStatus('Unrecognized session — open this level from the lobby.');
+  }
+}
+
+resize();
+bootFromSession();
+})();
+</script>
+</body>
+</html>

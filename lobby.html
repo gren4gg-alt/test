@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Duble Trouble — Lobby</title>
+<style>
+:root {
+  --bg: #14151c; --panel: #1e2029; --panel-2: #262838;
+  --text: #f0f1f5; --text-dim: #9a9cab;
+  --accent: #4bd07a; --danger: #e06c75;
+  --radius: 14px; --tap: 48px;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  -webkit-tap-highlight-color: transparent; overscroll-behavior: none;
+}
+.hidden { display: none !important; }
+.screen {
+  min-height: 100dvh;
+  padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column;
+}
+.primary-btn {
+  width: 100%; min-height: var(--tap); border: none; border-radius: var(--radius);
+  background: var(--accent); color: #0c1410; font-size: 17px; font-weight: 700; cursor: pointer;
+}
+.primary-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.primary-btn:active:not(:disabled) { transform: scale(0.98); }
+.danger-btn {
+  width: 100%; min-height: 40px; border: none; border-radius: 10px;
+  background: rgba(224,108,117,.15); color: var(--danger); font-weight: 600; cursor: pointer;
+}
+.icon-btn {
+  width: var(--tap); height: var(--tap); border: none; border-radius: 50%;
+  background: var(--panel-2); color: var(--text); font-size: 20px; cursor: pointer;
+}
+.icon-btn-sm {
+  width: 32px; height: 32px; border-radius: 50%; border: none;
+  background: var(--panel-2); color: var(--text); font-size: 13px; cursor: pointer;
+}
+#screen-join { justify-content: center; }
+.panel { max-width: 420px; width: 100%; margin: 0 auto; }
+.title { text-align: center; font-size: 32px; margin-bottom: 6px; }
+.subtitle { text-align:center; color: var(--text-dim); font-size:14px; margin:0 0 26px; }
+.divider { display:flex; align-items:center; gap:10px; margin:18px 0; color:var(--text-dim); font-size:13px; }
+.divider::before, .divider::after { content:''; flex:1; height:1px; background:var(--panel-2); }
+.join-form { display:flex; flex-direction:column; gap:10px; }
+.code-input {
+  min-height: var(--tap); border-radius: var(--radius); border: 2px solid var(--panel-2);
+  background: var(--panel); color: var(--text); text-align:center;
+  font-size: 22px; letter-spacing: 4px; text-transform: uppercase; width:100%;
+}
+.code-input:focus { outline:none; border-color: var(--accent); }
+.error-text { color: var(--danger); text-align:center; margin-top:14px; font-size:14px; }
+.lobby-header { display:flex; align-items:center; justify-content:space-between; padding:8px 4px 18px; }
+.room-label { font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px; }
+.room-code { font-size:26px; font-weight:700; letter-spacing:3px; }
+.panel-section { margin-bottom:22px; }
+.section-title { font-size:15px; margin:0 0 8px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; }
+.hint-text { font-size:13px; color:var(--text-dim); margin:0 0 10px; }
+.player-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
+.player-row {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  background:var(--panel); border-radius:12px; padding:10px 12px; min-height:44px;
+}
+.player-swatch { width:18px; height:18px; border-radius:50%; flex-shrink:0; }
+.player-name { flex:1; font-size:15px; }
+.player-tag { font-size:11px; color:var(--text-dim); background:var(--panel-2); padding:3px 8px; border-radius:8px; }
+.player-check { color:var(--accent); font-size:18px; width:22px; text-align:center; }
+.player-row.speaking { box-shadow:0 0 0 2px var(--accent); animation:voice-pulse 1.2s ease-in-out infinite; }
+@keyframes voice-pulse {
+  0%,100% { box-shadow:0 0 0 2px var(--accent); }
+  50% { box-shadow:0 0 9px 2px var(--accent); }
+}
+.level-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(140px,1fr)); gap:10px; }
+.level-tile {
+  min-height:84px; border-radius:var(--radius); background:var(--panel);
+  border:2px solid transparent; color:var(--text); padding:10px; text-align:left;
+  cursor:pointer; display:flex; flex-direction:column; justify-content:space-between; font-size:14px;
+}
+.level-tile.selected-mine { border-color:var(--accent); background:var(--panel-2); }
+.level-tile.locked { opacity:.35; cursor:not-allowed; }
+.level-tile .lvl-name { font-weight:600; }
+.level-tile .lvl-meta { font-size:11px; color:var(--text-dim); }
+.level-tile .picks { display:flex; gap:4px; flex-wrap:wrap; margin-top:6px; }
+.level-tile .pick-dot { width:10px; height:10px; border-radius:50%; }
+.lobby-footer { margin-top:auto; padding-top:12px; }
+.status-text { text-align:center; font-size:13px; color:var(--text-dim); margin:0 0 10px; min-height:16px; }
+.corner-overlay {
+  position:fixed; top:calc(10px + env(safe-area-inset-top));
+  right:calc(10px + env(safe-area-inset-right)); z-index:50;
+}
+.voice-compact { display:flex; align-items:center; gap:8px; }
+.vc-mute-btn {
+  width:var(--tap); height:var(--tap); border-radius:50%; border:none;
+  background:var(--panel-2); color:var(--text); font-size:20px; cursor:pointer;
+}
+.vc-mute-btn.muted { background:rgba(224,108,117,.25); color:var(--danger); }
+.voice-dots { display:flex; gap:4px; align-items:center; }
+.voice-dot { width:10px; height:10px; border-radius:50%; background:var(--panel-2); border:1.5px solid rgba(255,255,255,.15); }
+.voice-dot.speaking { animation:voice-pulse-dot 1s ease-in-out infinite; background:var(--accent); }
+.voice-dot.error { background:var(--danger); border-color:var(--danger); }
+@keyframes voice-pulse-dot {
+  0%,100% { box-shadow:0 0 0 0 rgba(75,208,122,.6); }
+  50% { box-shadow:0 0 6px 3px rgba(75,208,122,.6); }
+}
+.settings-panel {
+  position:absolute; top:calc(var(--tap) + 8px); right:0; width:230px;
+  background:var(--panel); border-radius:var(--radius); padding:14px;
+  box-shadow:0 10px 30px rgba(0,0,0,.4); display:flex; flex-direction:column; gap:12px;
+}
+.settings-row { display:flex; flex-direction:column; gap:4px; font-size:13px; color:var(--text-dim); }
+.settings-row input[type=range] { width:100%; }
+.segmented { display:flex; border-radius:8px; overflow:hidden; border:1px solid var(--panel-2); }
+.seg-btn { flex:1; background:var(--panel); color:var(--text-dim); border:none; padding:8px 6px; font-size:12px; cursor:pointer; }
+.seg-btn.active { background:var(--accent); color:#0c1410; font-weight:700; }
+.peer-row { display:flex; align-items:center; gap:8px; font-size:12px; }
+.peer-row input[type=range] { flex:1; }
+.mini-btn {
+  width:26px; height:26px; border-radius:50%; border:none;
+  background:var(--panel-2); color:var(--text); font-size:11px; cursor:pointer; flex-shrink:0;
+}
+/* countdown */
+#countdown { position:fixed; inset:0; z-index:60; display:none;
+             flex-direction:column; align-items:center; justify-content:center;
+             gap:8px; background:rgba(20,21,28,.92); }
+#countdown.on { display:flex; }
+#cdNum { font:700 96px -apple-system, system-ui, sans-serif; color:var(--accent); line-height:1;
+         animation:cdPop .45s ease-out; }
+#cdMsg { color:var(--text-dim); font-size:15px; }
+@keyframes cdPop { from { transform:scale(.55); opacity:0 } to { transform:scale(1); opacity:1 } }
+@media (min-width:700px) {
+  .screen { padding-left:40px; padding-right:40px; }
+  .panel-section, .lobby-header, .lobby-footer { max-width:640px; margin-left:auto; margin-right:auto; width:100%; }
+}
+</style>
+</head>
+<body>
+
+<!-- Persistent voice/settings overlay. Mounted once, never torn down. -->
+<div id="corner-overlay" class="corner-overlay hidden">
+  <div class="voice-compact">
+    <button id="voice-self-btn" class="vc-mute-btn" type="button" aria-label="Mute microphone">🎤</button>
+    <div id="voice-dots" class="voice-dots"></div>
+    <button id="settings-btn" class="icon-btn-sm" type="button" aria-label="Settings">⚙</button>
+  </div>
+  <div id="settings-panel" class="settings-panel hidden">
+    <div class="settings-row">
+      <span>Voice mode</span>
+      <div class="segmented" id="voice-mode-switch">
+        <button type="button" data-mode="always" class="seg-btn">Always on</button>
+        <button type="button" data-mode="ptt" class="seg-btn">Push (V)</button>
+      </div>
+    </div>
+    <div class="settings-row">
+      <span>Players</span>
+      <div id="peer-volumes"></div>
+    </div>
+    <button id="reset-progress-btn" class="danger-btn" type="button">Reset my progress</button>
+    <button id="leave-btn" class="danger-btn" type="button">Leave session</button>
+  </div>
+</div>
+
+<!-- SCREEN 1: join / host -->
+<section id="screen-join" class="screen">
+  <div class="panel">
+    <h1 class="title">Duble Trouble</h1>
+    <p class="subtitle">Co-op puzzles. Grab a friend.</p>
+    <button id="host-btn" class="primary-btn" type="button">Host a room</button>
+    <div class="divider"><span>or</span></div>
+    <form id="join-form" class="join-form" autocomplete="off">
+      <input id="room-code-input" class="code-input" type="text" inputmode="latin"
+             maxlength="64" placeholder="ROOM CODE" autocapitalize="characters" spellcheck="false">
+      <button id="join-btn" class="primary-btn" type="submit">Join room</button>
+    </form>
+    <p id="join-error" class="error-text hidden"></p>
+  </div>
+</section>
+
+<!-- SCREEN 2: lobby -->
+<section id="screen-lobby" class="screen hidden">
+  <header class="lobby-header">
+    <div>
+      <div class="room-label">Room code</div>
+      <div id="room-code-display" class="room-code">— — — —</div>
+    </div>
+    <button id="copy-code-btn" class="icon-btn" type="button" aria-label="Copy room code">📋</button>
+  </header>
+
+  <div class="panel-section">
+    <h2 class="section-title">Players</h2>
+    <ul id="player-list" class="player-list"></ul>
+  </div>
+
+  <div class="panel-section">
+    <h2 class="section-title">Choose a level</h2>
+    <p class="hint-text">Everyone must pick the same level to start.</p>
+    <div id="level-grid" class="level-grid"></div>
+  </div>
+
+  <footer class="lobby-footer">
+    <p id="lobby-status" class="status-text"></p>
+    <button id="start-btn" class="primary-btn" type="button" disabled>Start</button>
+  </footer>
+</section>
+
+<div id="countdown"><div id="cdNum">3</div><div id="cdMsg">Loading level…</div></div>
+
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="engine.js"></script>
+<script src="input.js"></script>
+<script src="netcode.js"></script>
+<script src="progress.js"></script>
+<script src="levels.js"></script>
+<script src="voicechat.js"></script>
+<script src="voicechat-adapter.js"></script>
+
+<script>
+"use strict";
+(function () {
+/* ==========================================================================
+   Lobby driver — the page-level half of netcode.js's HANDOFF CONTRACT.
+
+   Responsibilities (netcode.js owns none of these deliberately):
+     1. Create the Peer. The HOST's peer id IS the room code, on every page
+        it's ever on for this room — that's what lets a client's
+        peer.connect(roomCode) keep finding the host across navigations.
+     2. Render lobby state (players, level grid) from the snapshots
+        netcode gives us, and feed selections back in.
+     3. On Start: write sessionStorage['dt-session'] for our own role, then
+        navigate to the chosen level's page. Levels.urlFor() maps index to
+        URL; netcode only ever deals in indices.
+
+   This page never builds a world or runs a sim — window.Level doesn't
+   even exist here. That's why the client side below talks to the
+   connection directly instead of calling Client.start(), which would
+   immediately try to buildWorld() against a level that isn't loaded.
+   ========================================================================== */
+
+const { Host, Validate, PALETTE } = window.Netcode;
+const $ = id => document.getElementById(id);
+
+const SESSION_KEY = 'dt-session';
+const COUNTDOWN_SECS = 3;
+
+let peer = null;
+let isHost = false;
+let conn = null;          // client only
+let myToken = null;       // client only — from 'queued'/'welcome'
+let myPeerId = null;
+let mySlot = -1;
+let roomCode = null;
+let mySelection = null;   // client only; host keeps this inside netcode
+let lastSnap = null;
+let navigating = false;
+
+const setStatus = m => { $('lobby-status').textContent = m || ''; };
+const showJoinError = m => {
+  const el = $('join-error');
+  el.textContent = m; el.classList.toggle('hidden', !m);
+};
+
+function showScreen(which) {
+  for (const id of ['screen-join', 'screen-lobby']) {
+    $(id).classList.toggle('hidden', id !== which);
+  }
+  $('corner-overlay').classList.toggle('hidden', which === 'screen-join');
+}
+
+/* ---------------- level grid ---------------- */
+
+function renderLevelGrid(snap) {
+  const grid = $('level-grid');
+  const order = window.Levels.order;
+  grid.innerHTML = '';
+
+  for (let i = 0; i < order.length; i++) {
+    const locked = i >= snap.unlocked;
+    const tile = document.createElement('button');
+    tile.type = 'button';
+    tile.className = 'level-tile' + (locked ? ' locked' : '');
+    tile.disabled = locked;
+
+    const name = document.createElement('div');
+    name.className = 'lvl-name';
+    name.textContent = order[i].name;
+
+    const meta = document.createElement('div');
+    meta.className = 'lvl-meta';
+    meta.textContent = locked ? '🔒 Locked' : 'Level ' + (i + 1);
+
+    // Who has this level picked — one dot per player, in their colour.
+    const picks = document.createElement('div');
+    picks.className = 'picks';
+    for (const p of snap.players) {
+      if (p.selection !== i) continue;
+      const dot = document.createElement('span');
+      dot.className = 'pick-dot';
+      dot.style.background = p.color;
+      picks.appendChild(dot);
+      if (p.slot === mySlot) tile.classList.add('selected-mine');
+    }
+
+    tile.append(name, meta, picks);
+    tile.onclick = () => selectLevel(i);
+    grid.appendChild(tile);
+  }
+}
+
+function selectLevel(i) {
+  if (isHost) {
+    Host.selectLevel(i);
+  } else {
+    mySelection = i;
+    send({ type: 'select', level: i });
+    // Optimistic local echo: the authoritative version arrives in the next
+    // 'lobby' snapshot, but reflecting the tap immediately keeps the grid
+    // feeling responsive over a slow link.
+    if (lastSnap) {
+      const me = lastSnap.players.find(p => p.slot === mySlot);
+      if (me) { me.selection = i; renderLobby(lastSnap); }
+    }
+  }
+}
+
+/* ---------------- player list ---------------- */
+
+function renderPlayers(snap) {
+  const list = $('player-list');
+  list.innerHTML = '';
+  const V = window.VoiceUI;
+
+  for (const p of snap.players) {
+    const li = document.createElement('li');
+    li.className = 'player-row';
+
+    const sw = document.createElement('span');
+    sw.className = 'player-swatch';
+    sw.style.background = p.color;
+
+    const name = document.createElement('span');
+    name.className = 'player-name';
+    name.textContent = (p.slot === mySlot ? 'You' : 'Player ' + (p.slot + 1));
+
+    li.append(sw, name);
+
+    if (p.isHost) {
+      const tag = document.createElement('span');
+      tag.className = 'player-tag';
+      tag.textContent = 'Host';
+      li.appendChild(tag);
+    }
+
+    const prog = document.createElement('span');
+    prog.className = 'player-tag';
+    prog.textContent = p.progress + ' done';
+    li.appendChild(prog);
+
+    const check = document.createElement('span');
+    check.className = 'player-check';
+    check.textContent = p.selection !== null ? '✓' : '';
+    li.appendChild(check);
+
+    list.appendChild(li);
+  }
+}
+
+function renderLobby(snap) {
+  lastSnap = snap;
+  renderPlayers(snap);
+  renderLevelGrid(snap);
+
+  const n = snap.players.length;
+  const picked = snap.players.filter(p => p.selection !== null).length;
+
+  if (isHost) {
+    $('start-btn').disabled = !snap.ready;
+    $('start-btn').textContent = n < 2 ? 'Start (solo)' : 'Start';
+    setStatus(snap.ready
+      ? 'Everyone agrees — ready when you are.'
+      : (picked < n ? (n - picked) + ' still choosing…'
+                    : 'Everyone must pick the SAME level.'));
+  } else {
+    $('start-btn').disabled = true;
+    $('start-btn').textContent = 'Waiting for host…';
+    setStatus(snap.ready ? 'Ready — waiting for the host to start.'
+                         : 'Pick a level.');
+  }
+}
+
+/* ---------------- hand-off ---------------- */
+
+function writeSessionAndGo(level) {
+  if (navigating) return;
+  navigating = true;
+
+  let url;
+  try {
+    url = window.Levels.urlFor(level);
+  } catch (e) {
+    navigating = false;
+    setStatus('That level has no page yet (levels.js index ' + level + ').');
+    return;
+  }
+
+  try {
+    const payload = isHost
+      ? { role: 'host', roomCode: Host.selfId, hostSnapshot: Host.snapshot(level) }
+      : { role: 'client', roomCode: roomCode, token: myToken, level: level };
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(payload));
+  } catch (e) {
+    navigating = false;
+    setStatus('Could not save the session — is storage blocked?');
+    return;
+  }
+
+  // Host only: detach the pagehide 'bye' broadcast first, or every client
+  // is told the session ended a moment before they follow us to the very
+  // same page.
+  if (isHost) Host.prepareHandoff();
+
+  runCountdown(() => { location.href = url; });
+}
+
+function runCountdown(done) {
+  const el = $('countdown'), num = $('cdNum');
+  el.classList.add('on');
+  let n = COUNTDOWN_SECS;
+  num.textContent = n;
+  const tick = () => {
+    n--;
+    if (n <= 0) { done(); return; }
+    num.textContent = n;
+    num.style.animation = 'none'; void num.offsetWidth; num.style.animation = '';
+    setTimeout(tick, 1000);
+  };
+  setTimeout(tick, 1000);
+}
+
+/* ---------------- voice ---------------- */
+
+let voiceTimer = null;
+
+function voiceRoster() {
+  // Host has the full peer map. A client gets the list pushed down by the
+  // host (see VOICE ROSTER in netcode.js) — without it a client could only
+  // ever see the host, never the other clients.
+  if (isHost) return Host.rosterIds();
+  return (rosterFromHost && rosterFromHost.length) ? rosterFromHost
+                                                   : [roomCode, myPeerId];
+}
+let rosterFromHost = null;
+
+function renderVoice() {
+  const V = window.VoiceUI;
+  if (!V || !V.isSupported()) return;
+
+  $('voice-self-btn').classList.toggle('muted', V.isSelfMuted());
+  for (const b of $('voice-mode-switch').children) {
+    b.classList.toggle('active', b.dataset.mode === V.getMode());
+  }
+
+  const dots = $('voice-dots'); dots.innerHTML = '';
+  const vols = $('peer-volumes'); vols.innerHTML = '';
+
+  for (const id of voiceRoster()) {
+    if (id === myPeerId) continue;
+    const dot = document.createElement('div');
+    dot.className = 'voice-dot'
+      + (V.isPeerSpeaking(id) ? ' speaking' : '')
+      + (V.getPeerStatus(id) === 'error' ? ' error' : '');
+    dots.appendChild(dot);
+
+    const row = document.createElement('div');
+    row.className = 'peer-row';
+    const mute = document.createElement('button');
+    mute.className = 'mini-btn';
+    mute.textContent = V.isPeerLocallyMuted(id) ? '🔇' : '🔊';
+    mute.onclick = () => V.togglePeerMute(id);
+    const vol = document.createElement('input');
+    vol.type = 'range'; vol.min = 0; vol.max = 100;
+    vol.value = Math.round(V.getPeerVolume(id) * 100);
+    vol.oninput = () => V.setPeerVolume(id, vol.value / 100);
+    row.append(mute, vol);
+    vols.appendChild(row);
+  }
+}
+
+async function initVoice() {
+  const V = window.VoiceUI;
+  if (!V || !V.isSupported()) return;
+  await V.init(peer, {
+    onPeerConnected: renderVoice,
+    onPeerDisconnected: renderVoice,
+    onSpeakingChange: renderVoice,
+  });
+  V.onChange(renderVoice);
+  // Idempotent + self-healing: re-running it repairs a dropped call, so a
+  // heartbeat covers any roster message lost on the unreliable channel.
+  const sync = () => { V.sync(voiceRoster(), myPeerId); renderVoice(); };
+  if (isHost) Host.onRoster = sync;
+  voiceTimer = setInterval(sync, 2000);
+  sync();
+}
+
+$('voice-self-btn').onclick = () => { window.VoiceUI && window.VoiceUI.toggleSelfMute(); };
+$('settings-btn').onclick = () => $('settings-panel').classList.toggle('hidden');
+for (const b of $('voice-mode-switch').children) {
+  b.onclick = () => { window.VoiceUI && window.VoiceUI.setMode(b.dataset.mode); };
+}
+$('reset-progress-btn').onclick = () => {
+  window.Progress.reset();
+  if (isHost) Host.reportProgress(0); else send({ type: 'progress', v: 0 });
+  setStatus('Progress reset on this device.');
+};
+$('leave-btn').onclick = () => {
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+  location.reload();
+};
+
+/* ---------------- host ---------------- */
+
+function startHosting() {
+  isHost = true;
+  $('host-btn').disabled = $('join-btn').disabled = true;
+  showJoinError('');
+
+  // Auto-assigned id: it becomes the room code, and letting PeerJS pick it
+  // avoids the "ID is taken" collision a fixed code hits when a previous
+  // session's registration hasn't expired yet.
+  peer = new Peer({ debug: 1 });
+
+  peer.on('open', id => {
+    myPeerId = id; roomCode = id;
+    Host.prepare(peer, () => {}, {
+      totalLevels: window.Levels.count,
+      onLobby: snap => { mySlot = Host.mySlot; renderLobby(snap); },
+    });
+    Host.reportProgress(window.Progress.get());
+    mySlot = Host.mySlot;
+    $('room-code-display').textContent = id;
+    showScreen('screen-lobby');
+    initVoice();
+  });
+
+  peer.on('disconnected', () => {
+    if (peer && !peer.destroyed) { setStatus('Reconnecting…'); try { peer.reconnect(); } catch (e) {} }
+  });
+  peer.on('error', e => {
+    showJoinError('Could not host: ' + e.type);
+    $('host-btn').disabled = $('join-btn').disabled = false;
+  });
+}
+
+$('host-btn').onclick = startHosting;
+
+$('start-btn').onclick = () => {
+  if (!isHost || Host.chosenLevel === null) return;
+  const level = Host.chosenLevel;
+  $('start-btn').disabled = true;
+  // lock() closes the room to new joins AND reliably tells every client
+  // which level to load — they navigate off the back of that message.
+  Host.lock(level);
+  writeSessionAndGo(level);
+};
+
+/* ---------------- client ---------------- */
+
+function send(msg) {
+  if (conn && conn.open) { try { conn.send(msg); } catch (e) {} }
+}
+
+$('join-form').onsubmit = ev => {
+  ev.preventDefault();
+  const code = $('room-code-input').value.trim();
+  if (!Validate.roomCode(code)) { showJoinError("That room code doesn't look right."); return; }
+
+  isHost = false;
+  roomCode = code;
+  $('host-btn').disabled = $('join-btn').disabled = true;
+  showJoinError('');
+
+  peer = new Peer({ debug: 1 });
+  peer.on('open', id => {
+    myPeerId = id;
+    conn = peer.connect(code, { reliable: false, serialization: 'json' });
+
+    conn.on('open', () => {
+      send({ type: 'progress', v: window.Progress.get() });
+      showScreen('screen-lobby');
+      $('room-code-display').textContent = code;
+      setStatus('Connected — pick a level.');
+      initVoice();
+    });
+
+    conn.on('data', msg => {
+      if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'queued' && msg.token) { myToken = msg.token; return; }
+      if (msg.type === 'welcome' && msg.token) { myToken = msg.token; return; }
+      if (msg.type === 'roster' && Array.isArray(msg.peers)) {
+        rosterFromHost = msg.peers;
+        if (window.VoiceUI) { window.VoiceUI.sync(voiceRoster(), myPeerId); renderVoice(); }
+        return;
+      }
+      if (msg.type === 'full') { showJoinError('That room is full.'); location.reload(); return; }
+      if (msg.type === 'bye') { setStatus('The host ended the session.'); return; }
+
+      if (msg.type === 'lobby') {
+        // `you` is the host telling us which slot in this snapshot is
+        // ours — slot assignment normally rides on 'welcome', which
+        // doesn't arrive until the game starts, so without this we
+        // couldn't highlight our own row or selection here.
+        if (Number.isInteger(msg.you)) mySlot = msg.you;
+        renderLobby(msg);
+        return;
+      }
+
+      if (msg.type === 'starting' && Number.isInteger(msg.level)) {
+        setStatus('Starting…');
+        writeSessionAndGo(msg.level);
+        return;
+      }
+    });
+
+    conn.on('close', () => { if (!navigating) setStatus('Disconnected from host.'); });
+    conn.on('error', () => showJoinError('Connection error.'));
+  });
+
+  peer.on('disconnected', () => {
+    if (peer && !peer.destroyed) { try { peer.reconnect(); } catch (e) {} }
+  });
+  peer.on('error', e => {
+    showJoinError(e.type === 'peer-unavailable'
+      ? 'No room with that code.'
+      : 'Could not join: ' + e.type);
+    $('host-btn').disabled = $('join-btn').disabled = false;
+  });
+};
+
+$('copy-code-btn').onclick = () => {
+  if (!roomCode) return;
+  const done = () => setStatus('Room code copied.');
+  if (navigator.clipboard) navigator.clipboard.writeText(roomCode).then(done, () => {});
+  else done();
+};
+
+/* ---------------- entry ----------------
+   Arriving here with a live session means a level page sent the room back
+   (finished the last level, or bounced us out). Clear it — this page is
+   the fresh-start surface, and a stale session would otherwise make the
+   next level page try to resume a room that no longer exists. */
+try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+showScreen('screen-join');
+})();
+</script>
+</body>
+</html>
