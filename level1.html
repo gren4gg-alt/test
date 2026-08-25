@@ -443,6 +443,107 @@ function viewRect() {
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(resize, 100));
 
+// ---- mobile fullscreen on rotate --------------------------------------
+// Touch devices only. Turning to landscape goes fullscreen (the browser
+// chrome eats a lot of the width this shared-screen level needs);
+// turning back to portrait, or leaving fullscreen by any other route,
+// puts the device back exactly how it was.
+//
+// The catch: requestFullscreen() needs a user gesture, and an
+// orientationchange event does NOT count as one in Chrome/Firefox. So
+// when the direct attempt is rejected we arm a one-shot listener and go
+// fullscreen on the player's very next touch instead — which in practice
+// is immediate, since they rotated in order to play. iOS Safari on
+// iPhone has no element fullscreen at all; there the promise rejects,
+// the armed touch also fails, and nothing breaks — the page just stays
+// as it is. webkitRequestFullscreen is included for iPad and older
+// WebKit.
+const isTouch = window.matchMedia('(pointer: coarse)').matches;
+const isLandscape = () => window.matchMedia('(orientation: landscape)').matches;
+const fsEl = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+
+// What the orientation lock was before we touched it, so exiting can put
+// it back rather than just guessing 'portrait'. null = never locked.
+let priorOrientation = null;
+let armed = false;
+
+function lockLandscape() {
+  const o = screen.orientation;
+  if (!o || typeof o.lock !== 'function') return;
+  if (priorOrientation === null) priorOrientation = o.type || null;
+  // Rejects on desktop and on browsers that gate it — harmless either way.
+  o.lock('landscape').catch(() => {});
+}
+
+function restoreOrientation() {
+  const o = screen.orientation;
+  if (o && typeof o.unlock === 'function' && priorOrientation !== null) {
+    try { o.unlock(); } catch (e) {}
+  }
+  priorOrientation = null;
+}
+
+function armGesture() {
+  if (armed) return;
+  armed = true;
+  const go = () => {
+    armed = false;
+    window.removeEventListener('pointerdown', go);
+    window.removeEventListener('touchend', go);
+    if (isLandscape()) enterFullscreen();
+  };
+  window.addEventListener('pointerdown', go, { once: true });
+  window.addEventListener('touchend', go, { once: true });
+}
+
+function enterFullscreen() {
+  if (!isTouch || fsEl()) return;
+  const el = document.documentElement;
+  const req = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (!req) return;
+  let p;
+  try { p = req.call(el, { navigationUI: 'hide' }); } catch (e) { p = null; }
+  if (p && typeof p.then === 'function') {
+    p.then(lockLandscape).catch(armGesture);
+  } else {
+    // Older WebKit returns undefined rather than a promise.
+    lockLandscape();
+  }
+}
+
+function exitFullscreen() {
+  restoreOrientation();
+  if (!fsEl()) return;
+  const ex = document.exitFullscreen || document.webkitExitFullscreen;
+  if (ex) { try { ex.call(document); } catch (e) {} }
+}
+
+function syncFullscreenToOrientation() {
+  if (!isTouch) return;
+  if (isLandscape()) enterFullscreen();
+  else exitFullscreen();
+}
+
+if (isTouch) {
+  window.addEventListener('orientationchange', () => setTimeout(syncFullscreenToOrientation, 150));
+  // orientationchange is deprecated and missing on some Android builds;
+  // the media query fires reliably there. Both routes are idempotent.
+  const mq = window.matchMedia('(orientation: landscape)');
+  const onMq = () => syncFullscreenToOrientation();
+  if (mq.addEventListener) mq.addEventListener('change', onMq);
+  else if (mq.addListener) mq.addListener(onMq);
+
+  // Leaving fullscreen by any other route — swipe-down, back button, Esc
+  // — must also release the orientation lock, or the device stays stuck
+  // in landscape after the player has left the game.
+  const onFsChange = () => { if (!fsEl()) restoreOrientation(); setTimeout(resize, 60); };
+  document.addEventListener('fullscreenchange', onFsChange);
+  document.addEventListener('webkitfullscreenchange', onFsChange);
+
+  // Already sideways when the page opened.
+  if (isLandscape()) armGesture();
+}
+
 // Previous on-screen position per entity, so an arrow's heading can be
 // derived from its actual movement. Clients never receive velocity (see
 // netcode.js's Codec), so this is the only way to know which way a
