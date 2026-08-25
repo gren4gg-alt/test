@@ -69,11 +69,13 @@
   #exitProg.on { display:block; }
 
   #touch { display:none; position:fixed; inset:auto 0 0 0; z-index:10;
-           padding:0 18px 22px; justify-content:space-between; pointer-events:none; }
+           padding:0 16px 16px; justify-content:space-between; pointer-events:none; }
   @media (pointer: coarse) { #touch { display:flex; } }
-  .pad { display:flex; gap:12px; pointer-events:auto; }
-  .tbtn { width:66px; height:66px; border-radius:50%; border:1px solid #45455e;
-          background:rgba(40,40,58,.72); color:#d8d8ea; font-size:20px;
+  .pad { display:flex; gap:10px; pointer-events:auto; }
+  /* 50px is about the smallest a thumb target should go — below ~44px
+     accuracy falls off badly, and these get pressed under pressure. */
+  .tbtn { width:50px; height:50px; border-radius:50%; border:1px solid #45455e;
+          background:rgba(40,40,58,.72); color:#d8d8ea; font-size:16px;
           display:flex; align-items:center; justify-content:center;
           backdrop-filter: blur(3px); }
   .tbtn.pressed { background:rgba(90,90,130,.9); }
@@ -411,6 +413,13 @@ window.bindTouchButton($('btnAction'), input, 'action');
 
 let side = null, peer = null, running = false, myPeerId = null;
 
+// Matches the (pointer: coarse) media query that reveals #touch, so the
+// view lift and the buttons can never disagree about whether the pad is
+// on screen.
+const TOUCH_UI = window.matchMedia('(pointer: coarse)').matches;
+// How far up the world is nudged to clear the control pad, in screen px.
+const TOUCH_VIEW_LIFT = 40;
+
 const animStates = new WeakMap();
 let lastFrameAt = performance.now();
 
@@ -617,6 +626,15 @@ function draw() {
     : Math.min(cw / view.w, ch / view.h);
   offX = (cw - view.w * scale) / 2;
   offY = (ch - view.h * scale) / 2;
+
+  // On touch devices the control pad occupies the bottom strip of the
+  // window, and the action is at ground level — so a centred view puts
+  // the players right behind the buttons. Shift the whole view up by
+  // roughly half the pad's height: the characters clear the buttons, and
+  // the extra room opens up above them, where the arrows come from.
+  // Screen-space, applied after scale, so it's a constant number of
+  // pixels regardless of how far the camera is zoomed.
+  if (TOUCH_UI) offY -= TOUCH_VIEW_LIFT;
 
   ctx.save();
   ctx.setTransform(canvas.width / cw, 0, 0, canvas.height / ch, 0, 0);
