@@ -3,13 +3,24 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Duble Trouble — Arrow Gap</title>
+<title>Duble Trouble — The Chamber</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   html, body { margin:0; height:100%; overflow:hidden; background:#14141c; color:#e6e6f0;
                font-family: system-ui, -apple-system, sans-serif;
                -webkit-user-select:none; user-select:none; }
+
+  /* ---- Three.js Background Canvas ---- */
+  #bg-canvas {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 0;
+    pointer-events: none;
+  }
 
   /* Replaces the old #lobby host/join screen — this page only ever
      arrives via hand-off from the lobby (see HANDOFF CONTRACT in
@@ -29,9 +40,9 @@
   #endedBtn { font:inherit; padding:11px 18px; border-radius:8px; border:1px solid #3a3a4c;
               background:#242430; color:#e6e6f0; cursor:pointer; }
 
-  #stage { position:fixed; inset:0; display:none; }
+  #stage { position:fixed; inset:0; display:none; z-index: 1; }
   #stage.on { display:block; }
-  canvas { display:block; width:100%; height:100%; touch-action:none; }
+  canvas#game { display:block; width:100%; height:100%; touch-action:none; background: transparent; }
   #hud { position:fixed; top:6px; left:8px; font:11px ui-monospace, monospace;
          color:#6a6a80; pointer-events:none; z-index:5; }
 
@@ -87,7 +98,7 @@
   @media (pointer: coarse) and (orientation: portrait) { #rotate { display:flex; } }
 
   /* ---- voice/settings overlay (top-right, persistent once in-game) ---- */
-  #voiceBar { position:fixed; top:6px; right:8px; z-index:15; display:none;
+  #voiceBar { position:fixed; top:6px; right:8px; z-index:60; display:none;
               align-items:center; gap:6px; }
   #voiceBar.on { display:flex; }
   .vbtn { width:30px; height:30px; border-radius:50%; border:1px solid #45455e;
@@ -115,6 +126,9 @@
 </style>
 </head>
 <body>
+
+<!-- Three.js Background Canvas -->
+<canvas id="bg-canvas"></canvas>
 
 <div id="rotate">
   <span>&#8635;</span>
@@ -173,210 +187,510 @@
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
 <script src="engine.js"></script>
 <script src="input.js"></script>
 
 <!-- ==========================================================================
-     Level: Arrow Gap — inlined here in place of level.js.
-     Tunables: ARROW_COUNT, ARROW_GAP, ARROW_SPEED, JUMP_GAP.
+     Three.js Atmospheric Dark Valley Background Setup (Violet Grass Accent)
+     ========================================================================== -->
+<script>
+(function() {
+  "use strict";
+  const canvas = document.getElementById('bg-canvas');
+  const ctx = canvas.getContext('2d');
+
+  function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  // Create background particles (stars / dust)
+  const particleCount = 40;
+  const particles = [];
+
+  for (let i = 0; i < particleCount; i++) {
+    particles.push({
+      x: Math.random() * canvas.width,
+      y: Math.random() * canvas.height,
+      size: Math.random() * 2.5 + 0.5,
+      speed: Math.random() * 0.4 + 0.1, // Horizontal drift speed
+      opacity: Math.random() * 0.7 + 0.3
+    });
+  }
+
+  function animateBG() {
+    requestAnimationFrame(animateBG);
+
+    // Deep twilight background gradient
+    const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    grad.addColorStop(0, '#141026');
+    grad.addColorStop(1, '#0d0b18');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Update and draw moving particles
+    ctx.fillStyle = '#b19cd9'; // Soft violet tint to match your game vibe
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      
+      // Move particle to the left
+      p.x -= p.speed;
+      
+      // If it goes off-screen, wrap it back around to the right
+      if (p.x < 0) {
+        p.x = canvas.width;
+        p.y = Math.random() * canvas.height;
+      }
+
+      ctx.globalAlpha = p.opacity;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1.0; // Reset alpha
+  }
+
+  animateBG();
+})();
+</script>
+<!-- ==========================================================================
+     Level 7: The Chamber — inlined here in place of level.js.
+
+     THE ROUTE
+       Bottom floor: spawn, a pit, a low wall you jump, a cannon firing back
+       along the floor, the air switch, and the box in the right-hand shaft.
+       The room above is open underneath — its lowest platform is past a solo
+       jump, so one player boosts another up. Whoever stays below hits the
+       switch; the air lifts the box up the shaft and pushes it left along
+       the ceiling, dropping it on the long platform. A player up there
+       carries it and throws it down, and the player below uses it as a step
+       to climb, cross the fire, and reach the exit.
+
+     EVERYTHING POSITIONAL IS IN THE CONFIG BLOCK BELOW — platforms, walls,
+     cannons, switch, box, goal. Edit those numbers; nothing in build() has
+     hardcoded geometry.
+
+     GOD MODE for testing is one clearly-marked block near the top and one
+     line inside the tick. Both are tagged GOD-MODE so they can be deleted
+     together.
+
+     REQUIRES netcode's level-message relay for Pause on non-host players.
+     Everything else works without it.
      ========================================================================== -->
 <script>
 (function () {
 "use strict";
 
-const { StaticBody, Entity, TriggerZone, ProjectileSpawner } = window.Engine;
+const { StaticBody, TriggerZone, BouncingBall, Box, Player, aabbOverlap } = window.Engine;
 
-const ARROW_COUNT = 12;
-const ARROW_GAP    = 70;
-const ARROW_SPEED  = 70;
-const JUMP_GAP      = 30;
+/* ======================================================================
+   GOD-MODE — testing only. Delete this whole block and the one tagged
+   line inside the level tick to remove it entirely.
+   ====================================================================== */
+const GOD = {
+  on: true,             // master switch
+  jumpVelocity: 1000,    // engine default is 560 (~92px apex)
+  invulnerable: true,    // hazards cannot kill
+  showHitboxes: false,
+};
+if (GOD.on && window.Engine.PHYSICS) {
+  window.Engine.PHYSICS.JUMP_VELOCITY = GOD.jumpVelocity;
+  console.warn('[level7] GOD MODE ON — jump ' + GOD.jumpVelocity +
+               (GOD.invulnerable ? ', invulnerable' : ''));
+}
+/* ==================== end GOD-MODE ==================================== */
 
-// 'follow' — camera tracks the players (engine.js's Camera, already
-// simulated and synced; this just renders through it). 'whole' — the
-// old behaviour, the entire level letterboxed to fit the window.
+/* ======================================================================
+   LAYOUT CONFIG — every position in the level, in level pixels.
+   x grows right, y grows DOWN, and an entity's x/y is its top-left corner.
+   ====================================================================== */
+const LEVEL = {
+  width:  1304,
+  height: 630,
+  floorY: 540,           // the bottom floor's top surface
+  ceilY:  16,            // the room's ceiling
+};
+
+// Ground strips. The space between two of them is a pit, and a pit kills.
+const FLOOR = [
+  { x: 0,   w: 320 },    // spawn side
+  { x: 450, w: 774 },    // the long run  (gap 320..450 = 130px pit)
+];
+
+// Solid blocks: the low wall, the room shell, the shaft divider.
+// 'stopsFire: true' means a fire or cannonball touching it is destroyed.
+const WALLS = [
+  { id: 'lowWall',  x: 456,  y: 485, w: 26,  h: 55,  stopsFire: true },
+  { id: 'ceiling',  x: 550,  y: 16,  w: 690, h: 16,  stopsFire: true },
+  { id: 'rightWall',x: 1224, y: 16,  w: 16,  h: 524, stopsFire: true },
+  { id: 'leftWall', x: 550,  y: 16,  w: 16,  h: 470, stopsFire: true },
+  { id: 'shaftDiv', x: 1156, y: 100, w: 16,  h: 440, stopsFire: true },
+];
+
+// Platforms, bottom to top. Each is climbed from the one before it, so
+// consecutive entries need to overlap in x — climbing while moving
+// sideways barely works (see JUMP NOTES below).
+const PLATFORMS = [
+  { id: 'step1', x: 1050, y: 420, w: 114, h: 16 },   // boosted up from the floor
+  { id: 'step2', x: 560, y: 350, w: 500, h: 16 },
+  { id: 'step3', x: 710, y: 220, w: 446, h: 16 },
+  { id: 'step35', x: 620, y: 280, w: 30, h: 16 },   // long; the box lands here
+  { id: 'step4', x: 997, y: 150, w: 160, h: 16 },
+  { id: 'exit',  x: 566, y: 148, w:  94, h: 16 },   // flat hop from step4
+];
+
+// Cannons. dir -1 fires left, +1 right. 'kind' picks what comes out.
+const CANNONS = [
+  { id: 'ground', x: 1106, y: 510, dir: -1, kind: 'ball', interval: 1.8, speed: 175 },
+  { id: 'fire1',  x: 570,  y: 320, dir:  1, kind: 'fire', interval: 1.3, speed: 190 },
+  { id: 'fire2',  x: 1100,  y: 190, dir:  -1, kind: 'fire', interval: 1, speed: 200 },
+];
+
+const SWITCH_POS = { x: 920, y: 512 };
+const BOX_POS    = { x: 1196, y: 496 };
+const GOAL_POS   = { x: 580, y: 95, w: 60, h: 56 };
+
+// The air. Shaft is the vertical lift; the ceiling run carries the box left
+// and lets go once it is past releaseX, so it falls onto step3.
+const AIR = {
+  shaftL: 1156, shaftR: 1224,
+  liftSpeed: 210,
+  pushSpeed: 190,
+  releaseX: 1156,
+};
+
+const BOX_D = 44;
+const BALL_D = 20;
+const FIRE_D = 16;
+const CANNON_LEN = 52, CANNON_H = 30;
+/* ==================== end LAYOUT CONFIG =============================== */
+
+/* ---- JUMP NOTES -------------------------------------------------------
+   JUMP_VELOCITY 560 against GRAVITY 1700 gives a ~92px apex and ~171px of
+   flat distance at MOVE_SPEED 260. Climbing costs horizontal reach fast:
+   landing 70px higher leaves only ~44px of sideways travel. So platforms
+   you climb between should sit directly above one another. A player is 40px
+   tall, so standing on a teammate reaches ~132px, and standing on a box
+   (44px) reaches ~136px.
+   -------------------------------------------------------------------- */
+
 const VIEW_MODE = 'follow';
+const LAND_COLOR  = '#a778d6';
+const WALL_COLOR  = '#8a5fbd';
+const GOAL_COLOR  = '#f0c419';
+const FIRE_COLOR  = '#e8603c';
+const IRON_COLOR  = '#7a5240';
+const SWITCH_OFF  = '#5a4a72';
+const SWITCH_ON   = '#f0c419';
 
-// Derived from engine.js's PHYSICS, not guessed: JUMP_VELOCITY 560 against
-// GRAVITY 1700 gives ~0.66s of airtime, and MOVE_SPEED 260 carries you
-// ~171px in that time. That's the absolute theoretical maximum from a
-// perfect full-speed running jump, so gaps are held to ~75% of it to stay
-// humanly clearable. Any gap wider than 171 is literally impossible and
-// the level becomes unfinishable — which is exactly what the original
-// 230px chasm was.
-const MAX_JUMP = Math.round((2 * 560 / 1700) * 260);   // 171
-const SAFE_JUMP = Math.round(MAX_JUMP * 0.75);          // 128
+const IS_HOST = (function () {
+  try {
+    const raw = sessionStorage.getItem('dt-session');
+    if (!raw) return true;
+    return (JSON.parse(raw).role || 'host') !== 'client';
+  } catch (e) { return true; }
+})();
 
-const H_ = 540;
-const FLOOR_Y = 440;
-const START_W = 170;
-const GAP_MARGIN = 40;
-const chasmStartX = START_W;
-const arrowsSpanW = (ARROW_COUNT - 1) * ARROW_GAP;
-const chasmEndX = chasmStartX + GAP_MARGIN * 2 + arrowsSpanW;
-const chasmW = chasmEndX - chasmStartX;
+const NC = window.Netcode || {};
+const RELAY_OK = IS_HOST
+  ? typeof (NC.Host && NC.Host.broadcastLevelMsg) === 'function'
+  : typeof (NC.Client && NC.Client.sendLevelMsg) === 'function';
 
-// Stepping stones across the chasm, spaced so no single jump exceeds
-// SAFE_JUMP. Count scales with the chasm, so changing ARROW_COUNT or
-// ARROW_GAP can never silently produce an uncrossable gap again.
-const STONE_W = 54;
-const stoneCount = Math.max(0, Math.ceil((chasmW - SAFE_JUMP) / (SAFE_JUMP + STONE_W)));
-// Gap is what must stay jumpable, so solve for it directly: n stones and
-// n+1 equal gaps span the chasm. (Distributing stone CENTRES evenly
-// instead makes the two end gaps a stone-width wider than the inner
-// ones — at 12 arrows that pushed them to 159px, right on the edge of
-// the 171px absolute maximum.)
-const stoneGap = stoneCount > 0 ? (chasmW - stoneCount * STONE_W) / (stoneCount + 1) : 0;
-const stoneXs = [];
-for (let i = 0; i < stoneCount; i++) {
-  stoneXs.push(chasmStartX + stoneGap * (i + 1) + STONE_W * i);
+/* ---- Hazards ---------------------------------------------------------
+   Each subclasses BouncingBall so netcode's codec syncs it by instanceof,
+   colour included. Every movement method is stubbed; the level tick drives
+   all of it, so there is no engine gravity or bounce to fight.
+   -------------------------------------------------------------------- */
+const NOOP = function () {};
+function inert(C) {
+  C.prototype.update = NOOP; C.prototype.step = NOOP; C.prototype.tick = NOOP;
+  C.prototype.simulate = NOOP; C.prototype.integrate = NOOP;
 }
 
-const safeSpaceW = 630;
-const stepW = 80;
-// The second step is deliberately wider than the first: it carries the
-// death orb, and a player who has learned that needs somewhere on the
-// platform to stand that ISN'T under the orb. At the old 80px the
-// platform was barely wider than the player, so there was no "avoid it"
-// option — only "don't come here", which makes the step useless.
-const step2W = 190;
-const step1X = chasmEndX + safeSpaceW + JUMP_GAP;
-const step2X = step1X + stepW + JUMP_GAP;
-const exitX = step2X + step2W + JUMP_GAP;
-
-// ---- Orbs -------------------------------------------------------------
-// Two floating lights above the steps. The first is pure decoration; the
-// second kills on contact. Same size and same bob so they read as a pair
-// and the lethal one has to be learned.
-const ORB_R = 7;                 // radius, px
-const ORB_HOVER = 26;            // height above the platform surface
-// Where along the second step the death orb sits, 0..1 across its width.
-// Kept off-centre so the safe standing room is one contiguous strip
-// rather than two thin slivers either side.
-const DEATH_ORB_T = 0.34;
-const exitPedestalW = 110;
-const LEVEL_W = exitX + exitPedestalW + 40;
-
-const PLATFORM_COLOR = '#4a4a5e';
-const GOAL_COLOR = '#f0c419';
+class Shot extends BouncingBall {
+  // One class for both cannonballs and fire — they behave identically
+  // (travel straight, die on a wall, kill on contact) and differ only in
+  // size, colour, and which art branch draws them.
+  constructor(x, y, vx, isFire) {
+    const d = isFire ? FIRE_D : BALL_D;
+    super(x, y, d, d, {
+      vx: vx, vy: 0, friction: 0, minSpeed: Math.abs(vx),
+      killsPlayers: false,
+      color: isFire ? FIRE_COLOR : IRON_COLOR,
+    });
+    this.solid = false;
+    this.kind = isFire ? 'fire' : 'cannonball';
+    this.speed = vx;
+  }
+}
+class Switch extends BouncingBall {
+  constructor(x, y) {
+    super(x, y, 28, 28, { vx: 0, vy: 0, friction: 0, minSpeed: 0, killsPlayers: false, color: SWITCH_OFF });
+    this.solid = false; this.kind = 'switch'; this.active = false;
+  }
+}
+class Cannon extends BouncingBall {
+  // Visual only, but synced so clients see it in place with no messaging.
+  constructor(x, y, dir) {
+    super(x, y, CANNON_LEN, CANNON_H, { vx: 0, vy: 0, friction: 0, minSpeed: 0, killsPlayers: false, color: IRON_COLOR });
+    this.solid = false; this.kind = 'cannon'; this.dir = dir;
+  }
+}
+[Shot, Switch, Cannon].forEach(inert);
 
 window.Level = {
-  // MUST be the real computed size. Hardcoding a smaller box (e.g. 1000)
-  // doesn't shrink the level — the geometry is still built out to
-  // LEVEL_W — it just makes the renderer and the camera bounds disagree
-  // with where things actually are, which is what cut the exit off the
-  // right-hand edge.
-  WIDTH: LEVEL_W,
-  HEIGHT: H_,
+  WIDTH: LEVEL.width,
+  HEIGHT: LEVEL.height,
   VIEW_MODE: VIEW_MODE,
 
   spawnPoint(slot) {
-    return { x: 40 + (slot % 4) * 30, y: FLOOR_Y - 40 - Math.floor(slot / 4) * 40 };
+    return { x: 40 + (slot % 4) * 32, y: LEVEL.floorY - 40 - Math.floor(slot / 4) * 44 };
   },
 
   build(world, nw) {
-    world.deathY = H_ + 80;
+    world.deathY = LEVEL.height + 80;
+    world.cameraOpts = { blockBottom: false };     // the pit has to be lethal
 
-    // netcode.js's buildWorld() ALWAYS calls enableCamera(), and Camera
-    // defaults every edge to blocking — including the bottom. That bottom
-    // wall is solid, so a player falling into the chasm lands on it and
-    // never reaches deathY: no death, no reset, just standing in mid-air
-    // over the pit. engine.js flags this exact interaction in Camera's
-    // own comments and says to flip blockBottom off per-level when a
-    // level relies on falling to kill. This level does, so: off.
-    // Left/right stay on (they're the co-op screen-lock mechanic).
-    world.cameraOpts = { blockBottom: false };
-
-    const start = new StaticBody(0, FLOOR_Y, START_W, 20);
-    start.color = PLATFORM_COLOR;
-    world.add(start);
-
-    for (let i = 0; i < ARROW_COUNT; i++) {
-      const x = chasmStartX + GAP_MARGIN + i * ARROW_GAP;
-      const dir = (i % 2 === 0) ? 1 : -1;
-      const spawner = new ProjectileSpawner(x, 20, {
-        vx: dir * ARROW_SPEED,
-        vy: ARROW_SPEED * (40 / 70),
-        gravity: null,        // world default gravity -> natural arc
-        // 'onLand' rather than the default 'bounds': with 'bounds' an
-        // arrow that hits a stone (or a player) freezes in place and
-        // hangs there until it leaves the level, which is why spent
-        // arrows were piling up on screen. 'onLand' despawns them the
-        // moment they connect — engine.js's projectile pass only
-        // despawns-on-kill for this rule.
-        despawn: 'onLand',
-        interval: 1.6,
-        phase: (i % 2) * 0.8,
-        // MUST match netcode.js TYPE_REGISTRY's projectile makeLocal
-        // (w:8, h:20) — the client materializes projectiles from that
-        // placeholder, not from anything sent over the wire, so a
-        // different size here would render correctly on the host and
-        // wrong on every client.
-        w: 8, h: 20,
-        color: '#e8d5a0',
-        kind: 'arrow',
-      });
-      world.add(spawner);
-      nw.spawners.push(spawner);
+    function slab(x, y, w, h, color) {
+      const b = new StaticBody(x, y, w, h);
+      b.color = color || LAND_COLOR;
+      world.add(b);
+      return b;
     }
 
-    const safe = new StaticBody(chasmEndX, FLOOR_Y, safeSpaceW, 20);
-    safe.color = PLATFORM_COLOR;
-    world.add(safe);
+    // Floor, walls, platforms — all straight from the config.
+    FLOOR.forEach(function (f) {
+      slab(f.x, LEVEL.floorY, f.w, LEVEL.height - LEVEL.floorY);
+    });
 
-    // Stepping stones inside the chasm — the crossing the arrows are
-    // meant to threaten. Without these the gap was 230px against a 171px
-    // maximum jump, so nobody ever got close enough to be hit.
-    for (const sx of stoneXs) {
-      const stone = new StaticBody(sx, FLOOR_Y, STONE_W, 16);
-      stone.color = '#565672';
-      world.add(stone);
-    }
+    const fireStoppers = [];
+    WALLS.forEach(function (w) {
+      const b = slab(w.x, w.y, w.w, w.h, WALL_COLOR);
+      if (w.stopsFire) fireStoppers.push(b);
+    });
 
-    const step1 = new StaticBody(step1X, FLOOR_Y - 60, stepW, 16);
-    step1.color = PLATFORM_COLOR;
-    world.add(step1);
-    const step2 = new StaticBody(step2X, FLOOR_Y - 60, step2W, 16);
-    step2.color = PLATFORM_COLOR;
-    world.add(step2);
+    PLATFORMS.forEach(function (p) {
+      slab(p.x, p.y, p.w, p.h);
+    });
 
-    // Orb 1 — decorative. solid:false and it never moves, so it needs no
-    // nw array and costs no bandwidth; it just renders.
-    const orb1 = new Entity(step1X + stepW / 2 - ORB_R, FLOOR_Y - 60 - ORB_HOVER - ORB_R,
-                            ORB_R * 2, ORB_R * 2);
-    orb1.solid = false;
-    orb1.kind = 'orb';
-    orb1.color = '#8f8fc8';
-    world.add(orb1);
+    const sw = new Switch(SWITCH_POS.x, SWITCH_POS.y);
+    world.add(sw);
 
-    // Orb 2 — lethal. The kill is a TriggerZone (effect:'kill'), the only
-    // static kill primitive that's reliably synced: it goes in
-    // nw.triggers and its position never moves, so host and clients agree
-    // for free. Killing a player ticks world.resetGeneration, which is
-    // the same path an arrow hit already uses — so touching this restarts
-    // the level with no extra netcode.
-    const orb2X = step2X + step2W * DEATH_ORB_T - ORB_R;
-    const orb2Y = FLOOR_Y - 60 - ORB_HOVER - ORB_R;
-    const deathOrb = new TriggerZone(orb2X, orb2Y, ORB_R * 2, ORB_R * 2,
-                                     { effect: 'kill', kind: 'death-orb' });
-    deathOrb.color = '#d94f4f';
-    world.add(deathOrb);
-    nw.triggers.push(deathOrb);
+    const liftBox = new Box(BOX_POS.x, BOX_POS.y, BOX_D, BOX_D);
+    world.add(liftBox);
+    nw.boxes.push(liftBox);
 
-    const pedestal = new StaticBody(exitX, FLOOR_Y - 60, exitPedestalW, 16);
-    pedestal.color = PLATFORM_COLOR;
-    world.add(pedestal);
+    // Every cannon is a real object, and its shots leave from its muzzle —
+    // so nothing ever appears out of thin air beside a wall.
+    const cannons = CANNONS.map(function (c) {
+      const ent = new Cannon(c.x, c.y, c.dir);
+      world.add(ent);
+      return { cfg: c, ent: ent, t: c.interval };   // first shot right away
+    });
 
-    const goal = new TriggerZone(exitX + 10, FLOOR_Y - 110, 80, 50, { effect: 'goal', kind: 'exit' });
+    const goal = new TriggerZone(GOAL_POS.x, GOAL_POS.y, GOAL_POS.w, GOAL_POS.h,
+                                 { effect: 'goal', kind: 'exit' });
     goal.color = GOAL_COLOR;
-    world.add(goal); nw.triggers.push(goal);
-    // 'each': a player touching the exit goes through it and is removed
-    // from the room; the level completes once everyone has been through.
+    world.add(goal);
+    nw.triggers.push(goal);
+
+    world.levelBounds = { minX: 0, minY: 0, maxX: LEVEL.width, maxY: LEVEL.height };
     nw.winCondition = { type: 'reach-goal', mode: 'each', goals: [goal] };
 
+    /* ---- Pause: a total stop, hazards and all -------------------------- */
+    let paused = false;
+    let pausedMirror = false;
+    window.Level7Pause = {
+      isPaused: function () { return IS_HOST ? paused : pausedMirror; },
+      toggle: function () {
+        if (IS_HOST) {
+          paused = !paused;
+          if (RELAY_OK) { try { NC.Host.broadcastLevelMsg({ k: 'pause', on: paused }); } catch (e) {} }
+        } else if (RELAY_OK) {
+          try { NC.Client.sendLevelMsg({ k: 'pauseReq' }); } catch (e) {}
+        }
+      },
+    };
+    if (RELAY_OK && IS_HOST) {
+      NC.Host.onLevelMsg = function (slot, payload) {
+        if (payload && payload.k === 'pauseReq') {
+          paused = !paused;
+          try { NC.Host.broadcastLevelMsg({ k: 'pause', on: paused }); } catch (e) {}
+        }
+      };
+    } else if (RELAY_OK) {
+      NC.Client.onLevelMsg = function (payload) {
+        if (payload && payload.k === 'pause') pausedMirror = !!payload.on;
+      };
+    }
+
+    /* ---- Level tick ---------------------------------------------------- */
+    let boxDelivered = false;
+    const engineStep = world.step.bind(world);
+
+    world.step = function (dt) {
+      if (IS_HOST && paused) return;      // nothing advances at all
+      engineStep(dt);
+      if (!IS_HOST || !(dt > 0)) return;
+
+      const players = [];
+      for (const p of nw.players.values()) if (p && !p.dead && !p.removed) players.push(p);
+
+      function killTouching(e) {
+        if (GOD.on && GOD.invulnerable) return;   // GOD-MODE
+        for (let j = 0; j < players.length; j++) {
+          const p = players[j];
+          if (p.invulnerableTimer > 0) continue;
+          if (!aabbOverlap(e, p)) continue;
+          if (typeof world.killPlayer === 'function') world.killPlayer(p);
+          else { p.dead = true; world.pendingReset = true; }
+        }
+      }
+
+      // Switch: one touch, on for good.
+      if (!sw.active) {
+        for (let i = 0; i < players.length; i++) {
+          if (aabbOverlap(sw, players[i])) { sw.active = true; sw.color = SWITCH_ON; break; }
+        }
+      }
+
+      // Fire every cannon on its own cadence, from its own muzzle.
+      for (let i = 0; i < cannons.length; i++) {
+        const c = cannons[i];
+        c.t += dt;
+        while (c.t >= c.cfg.interval) {
+          c.t -= c.cfg.interval;
+          const isFire = c.cfg.kind === 'fire';
+          const d = isFire ? FIRE_D : BALL_D;
+          const muzzleX = c.cfg.dir < 0 ? c.ent.x - d - 2 : c.ent.x + c.ent.w + 2;
+          const muzzleY = c.ent.y + CANNON_H / 2 - d / 2;
+          world.add(new Shot(muzzleX, muzzleY, c.cfg.dir * c.cfg.speed, isFire));
+        }
+      }
+
+      // Shots: travel, die on any fire-stopping wall, kill on contact.
+      const all = world.entities;
+      for (let i = all.length - 1; i >= 0; i--) {
+        const e = all[i];
+        if (!(e instanceof Shot)) continue;
+
+        e.vy = 0;
+        e.vx = e.speed;
+        e.x += e.vx * dt;
+
+        let stopped = false;
+        for (let k = 0; k < fireStoppers.length; k++) {
+          if (aabbOverlap(e, fireStoppers[k])) { stopped = true; break; }
+        }
+        if (stopped || e.x + e.w < 0 || e.x > LEVEL.width) { world.remove(e); continue; }
+
+        killTouching(e);
+      }
+
+      /* -- The air ---------------------------------------------------------
+         Up the shaft, left along the ceiling, released past AIR.releaseX so
+         it drops onto the long platform. Delivery is all the air does: a
+         player has to carry the box and throw it down. A carried box is
+         ignored, so the current cannot fight someone aiming a throw.
+         ------------------------------------------------------------------ */
+      if (!sw.active) return;
+
+      const riders = players.slice();
+      if (!liftBox.carried && !boxDelivered) riders.push(liftBox);
+
+      for (let i = 0; i < riders.length; i++) {
+        const r = riders[i];
+        const cx = r.x + r.w / 2;
+        const inShaft = cx > AIR.shaftL && cx < AIR.shaftR;
+        const atCeiling = r.y <= LEVEL.ceilY + 40;
+
+        if (inShaft && !atCeiling) r.vy = -AIR.liftSpeed;
+        else if (atCeiling && cx > AIR.releaseX) { r.vy = 0; r.vx = -AIR.pushSpeed; }
+      }
+
+      if (!boxDelivered && liftBox.x + liftBox.w / 2 <= AIR.releaseX) boxDelivered = true;
+    };
   },
 };
 
+})();
+</script>
+
+<!-- ==========================================================================
+     Level 7 controls + custom art — Back and Pause in the same #voiceBar
+     .vbtn style level 6 established, plus richer canvas art for fire,
+     cannonballs, the switch, and both boxes.
+     ========================================================================== -->
+<script>
+(function () {
+"use strict";
+
+/* ---- Controls ---------------------------------------------------------
+   Same pattern as level 6: buttons live in the shell's existing #voiceBar
+   with the .vbtn class, so they read as one control group with the mic and
+   gear rather than a second competing bar. This is the standard going
+   forward — Back plus whatever the level's own control is (Restart, Pause,
+   etc.) — all in #voiceBar.
+   -------------------------------------------------------------------- */
+(function controls() {
+  function mkVbtn(glyph, label, onclick) {
+    const b = document.createElement('button');
+    b.className = 'vbtn';
+    b.type = 'button';
+    b.innerHTML = glyph;
+    b.title = label;
+    b.setAttribute('aria-label', label);
+    b.onclick = onclick;
+    return b;
+  }
+
+  const bar = document.getElementById('voiceBar');
+  if (!bar) return;
+
+  const pauseBtn = mkVbtn('&#10074;&#10074;', 'Pause', function () {
+    if (window.Level7Pause) window.Level7Pause.toggle();
+  });
+
+  const back = mkVbtn('&#8592;', 'Leave the level', function () {
+    try { window.Netcode.Host.prepareHandoff(); } catch (e) {}
+    location.href = 'index.html';
+  });
+
+  bar.appendChild(pauseBtn);
+  bar.appendChild(back);
+
+  // "Paused" banner — visible to everyone, not just the host, since the
+  // freeze itself is total and gives no other visual cue that anything
+  // has happened rather than lagged.
+  const banner = document.createElement('div');
+  banner.textContent = 'II Paused';
+  banner.style.cssText =
+    'position:fixed;top:44px;left:50%;transform:translateX(-50%);z-index:61;' +
+    'display:none;padding:7px 16px;border-radius:999px;' +
+    'background:rgba(24,19,34,.85);border:1px solid rgba(255,255,255,.16);' +
+    'color:#e9e3f2;font:600 13px/1 system-ui,-apple-system,Segoe UI,sans-serif;' +
+    'letter-spacing:.04em;backdrop-filter:blur(6px);';
+  document.body.appendChild(banner);
+
+  (function loop() {
+    try {
+      const on = window.Level7Pause && window.Level7Pause.isPaused();
+      banner.style.display = on ? 'block' : 'none';
+      pauseBtn.style.opacity = on ? '0.65' : '1';
+    } catch (e) {}
+    requestAnimationFrame(loop);
+  })();
+})();
+
+/* ---- Custom art --------------------------------------------------------
+   Added as extra branches in the shell's per-entity draw dispatch, right
+   alongside its existing kind checks — the same anchor point used for the
+   level 5 ball/bomb art.
+   -------------------------------------------------------------------- */
 })();
 </script>
 
@@ -616,6 +930,7 @@ function draw() {
   lastFrameAt = now;
   const t = now / 1000;
 
+
   const W = window.Level.WIDTH, H = window.Level.HEIGHT;
   const view = viewRect();
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -638,41 +953,13 @@ function draw() {
 
   ctx.save();
   ctx.setTransform(canvas.width / cw, 0, 0, canvas.height / ch, 0, 0);
-  ctx.fillStyle = '#0e0e15';
-  ctx.fillRect(0, 0, cw, ch);
+  
+  // Clear canvas so the 3D Three.js background shows through
+  ctx.clearRect(0, 0, cw, ch);
+  
   ctx.translate(offX, offY);
   ctx.scale(scale, scale);
   ctx.translate(-view.x, -view.y);
-
-  // --- backdrop: vertical gradient + static starfield + far hills ---
-  const sky = ctx.createLinearGradient(0, 0, 0, H);
-  sky.addColorStop(0,   '#1b1b2e');
-  sky.addColorStop(0.6, '#191926');
-  sky.addColorStop(1,   '#12121a');
-  ctx.fillStyle = sky;
-  ctx.fillRect(0, 0, W, H);
-
-  // Deterministic pseudo-stars (no Math.random — purely visual, but a
-  // stable field looks intentional and doesn't shimmer frame to frame).
-  ctx.fillStyle = 'rgba(255,255,255,0.18)';
-  for (let i = 0; i < 60; i++) {
-    const sx = (i * 137.5) % W;
-    const sy = (i * 61.7) % (H * 0.55);
-    const tw = 0.6 + 0.4 * Math.sin(t * 1.5 + i);
-    ctx.globalAlpha = 0.18 * tw;
-    ctx.fillRect(sx, sy, 1.6, 1.6);
-  }
-  ctx.globalAlpha = 1;
-
-  ctx.fillStyle = '#15151f';
-  ctx.beginPath();
-  ctx.moveTo(0, H);
-  for (let x = 0; x <= W; x += 40) {
-    ctx.lineTo(x, H - 120 - 30 * Math.sin(x * 0.006) - 18 * Math.sin(x * 0.017));
-  }
-  ctx.lineTo(W, H);
-  ctx.closePath();
-  ctx.fill();
 
   const list = side.renderList();
 
@@ -732,6 +1019,113 @@ function draw() {
       ctx.shadowBlur = 0;
       ctx.fillStyle = 'rgba(255,220,220,0.85)';
       ctx.beginPath(); ctx.arc(cx, cy, e.w / 5, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+
+    } else if (e.kind === 'fire') {
+      // Flickering flame: a warm core with irregular tongues, animated with
+      // layered noise-ish sine terms so no two frames repeat exactly.
+      const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
+      const flick = t * 14 + x * 0.1;
+      ctx.save();
+      ctx.shadowColor = e.color;
+      ctx.shadowBlur = 12 + 6 * Math.sin(t * 9 + x);
+      ctx.fillStyle = e.color;
+      ctx.beginPath();
+      for (let k = 0; k <= 10; k++) {
+        const a = (k / 10) * Math.PI * 2;
+        const wobble = 1 + 0.28 * Math.sin(flick + a * 3) + 0.12 * Math.sin(flick * 1.7 - a * 5);
+        const px = cx + Math.cos(a) * r * wobble;
+        const py = cy + Math.sin(a) * r * wobble * 0.9 - r * 0.15 * Math.sin(flick * 0.6);
+        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255,224,150,0.85)';
+      ctx.beginPath(); ctx.arc(cx, cy - r * 0.1, r * 0.35, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+
+    } else if (e.kind === 'cannonball') {
+      // Cast-iron look: dark sphere, a curved highlight, a faint fuse
+      // ember trailing above it as it climbs.
+      const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
+      ctx.save();
+      const grad = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.35, r * 0.15, cx, cy, r);
+      grad.addColorStop(0, '#8a6a52');
+      grad.addColorStop(0.5, e.color);
+      grad.addColorStop(1, '#2c1f18');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.35)';
+      ctx.beginPath(); ctx.arc(cx - r * 0.3, cy - r * 0.3, r * 0.22, 0, Math.PI * 2); ctx.fill();
+      const emberFlick = 0.5 + 0.5 * Math.sin(t * 20 + x);
+      ctx.fillStyle = 'rgba(255,180,90,' + emberFlick + ')';
+      ctx.shadowColor = 'rgba(255,150,60,0.9)';
+      ctx.shadowBlur = 8 * emberFlick;
+      ctx.beginPath(); ctx.arc(cx, cy + r * 1.15, r * 0.18 * emberFlick, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+
+    } else if (e.kind === 'cannon') {
+      // Iron barrel on a mount, pointed left — the direction it fires. Drawn
+      // so the muzzle sits flush with the entity's left edge, which is
+      // exactly where the balls are spawned.
+      const bh = e.h * 0.62;
+      const by = y + e.h - bh;
+      ctx.save();
+      // Flip about the entity's centre when it fires right, so the muzzle is
+      // drawn on the side the shots actually leave from.
+      if (e.dir > 0) { ctx.translate(x + e.w / 2, 0); ctx.scale(-1, 1); ctx.translate(-(x + e.w / 2), 0); }
+      // mount
+      ctx.fillStyle = '#4a3428';
+      ctx.beginPath();
+      ctx.moveTo(x + e.w * 0.25, y + e.h);
+      ctx.lineTo(x + e.w * 0.85, y + e.h);
+      ctx.lineTo(x + e.w * 0.68, y + e.h - e.h * 0.32);
+      ctx.lineTo(x + e.w * 0.42, y + e.h - e.h * 0.32);
+      ctx.closePath(); ctx.fill();
+      // barrel
+      const g = ctx.createLinearGradient(0, by, 0, by + bh);
+      g.addColorStop(0, '#8a6a52');
+      g.addColorStop(0.45, e.color || '#7a5240');
+      g.addColorStop(1, '#2c1f18');
+      ctx.fillStyle = g;
+      roundRect(x, by, e.w * 0.92, bh, 4); ctx.fill();
+      // muzzle ring
+      ctx.fillStyle = '#241a14';
+      roundRect(x, by - 1, 6, bh + 2, 3); ctx.fill();
+      ctx.restore();
+
+    } else if (e.kind === 'switch') {
+      // Diamond lever. Dim and static when off; once touched it locks gold
+      // and pulses gently — the level's only permanent state change, so the
+      // art should read as "solved," not as a repeating hazard.
+      const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
+      const on = e.color !== '#5a4a72';
+      const pulse = on ? (0.6 + 0.4 * Math.sin(t * 3)) : 1;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(Math.PI / 4);
+      if (on) { ctx.shadowColor = e.color; ctx.shadowBlur = 10 * pulse; }
+      ctx.fillStyle = e.color;
+      ctx.globalAlpha = on ? 1 : 0.8;
+      ctx.fillRect(-r * 0.7, -r * 0.7, r * 1.4, r * 1.4);
+      ctx.restore();
+
+    } else if (e instanceof Box) {
+      // Wood-grain crate: base fill, a few darker grain lines, a routed
+      // border. Static art (no animation) — a box should read as solid and
+      // inert, unlike the hazards around it.
+      ctx.save();
+      ctx.fillStyle = '#8a5a34';
+      ctx.fillRect(x, y, e.w, e.h);
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+      ctx.lineWidth = 1;
+      for (let gy = y + e.h * 0.28; gy < y + e.h; gy += e.h * 0.32) {
+        ctx.beginPath(); ctx.moveTo(x + 2, gy); ctx.lineTo(x + e.w - 2, gy); ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(255,220,180,0.5)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x + 1.5, y + 1.5, e.w - 3, e.h - 3);
       ctx.restore();
 
     } else if (e.isTriggerZone || e.kind === 'exit') {
