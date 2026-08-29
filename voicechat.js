@@ -190,16 +190,46 @@ var VoiceChat = (function () {
   // ------------------------------------------------------------------
 
   /** Connect to every peer ID in the given roster (mesh formation). */
+  // Pending outbound dials held back by glare avoidance: peerId -> timeoutId.
+  const _pendingDial = new Map();
+  const GLARE_FALLBACK_MS = 1500;
+
   function connectToPeers(peerIds) {
     _assertInit();
     (peerIds || []).forEach(addPeer);
   }
 
-  /** Open a MediaConnection to a single peer (idempotent). */
+  /** Open a MediaConnection to a single peer (idempotent).
+   *
+   *  GLARE: the mesh is symmetric, so if both sides call addPeer() for each
+   *  other at the same moment, two MediaConnections exist for one pair. That
+   *  used to produce one-way audio (see _handleIncomingCall). To stop the
+   *  collision happening at all, only ONE side dials: the peer whose id sorts
+   *  lower. Both sides compute the same answer from ids alone, so no
+   *  coordination is needed.
+   *
+   *  The higher-id side waits to be called instead — but not forever. If the
+   *  other end never dials (it added us late, its roster was stale, or it is
+   *  running an older build of this file), GLARE_FALLBACK_MS later we dial
+   *  anyway. A duplicate call is now handled correctly, so the fallback is
+   *  safe even if it races.
+   */
   function addPeer(peerId) {
     _assertInit();
     if (!peerId || peerId === _peer.id || _peers.has(peerId)) return;
 
+    if (_peer.id < peerId) {
+      _dial(peerId);
+    } else if (!_pendingDial.has(peerId)) {
+      _pendingDial.set(peerId, setTimeout(function () {
+        _pendingDial.delete(peerId);
+        if (!_peers.has(peerId)) _dial(peerId);   // they never called us
+      }, GLARE_FALLBACK_MS));
+    }
+  }
+
+  function _dial(peerId) {
+    if (_peers.has(peerId)) return;
     const call = _peer.call(peerId, _localStream, {
       metadata: { voicechat: true },
     });
@@ -210,8 +240,14 @@ var VoiceChat = (function () {
     _registerCall(peerId, call);
   }
 
+  function _clearPendingDial(peerId) {
+    const t = _pendingDial.get(peerId);
+    if (t) { clearTimeout(t); _pendingDial.delete(peerId); }
+  }
+
   /** Close and remove a peer's voice connection (e.g. they left the room). */
   function removePeer(peerId) {
+    _clearPendingDial(peerId);
     const entry = _peers.get(peerId);
     if (!entry) return;
     _teardownEntry(entry);
@@ -221,16 +257,25 @@ var VoiceChat = (function () {
 
   function _handleIncomingCall(call) {
     _assertInit();
-    // Answer with our local stream regardless of who initiated —
-    // mesh is symmetric, so duplicate inbound/outbound calls to the
-    // same peer are resolved by preferring the existing entry.
-    if (_peers.has(call.peer)) {
-      // Already meshed with this peer via our own outbound call;
-      // still answer to avoid leaving them hanging, but don't
-      // double-register — the first successful stream wins.
-      call.answer(_localStream);
+    _clearPendingDial(call.peer);   // they dialled first; drop our fallback
+
+    const existing = _peers.get(call.peer);
+
+    // "First successful STREAM wins" — decided on the stream, not on which
+    // call object showed up first. The old code returned early whenever an
+    // entry existed, even one that had never produced audio, so an outbound
+    // call that stalled would permanently shadow a working inbound one. That
+    // is what made the host hear nothing while clients heard the host.
+    if (existing && existing.stream) {
+      call.answer(_localStream);    // already have working audio; be polite
       return;
     }
+    if (existing) {
+      // Entry exists but is silent — replace it with this call.
+      _teardownEntry(existing);
+      _peers.delete(call.peer);
+    }
+
     call.answer(_localStream);
     _registerCall(call.peer, call);
   }
@@ -520,6 +565,8 @@ var VoiceChat = (function () {
   // ------------------------------------------------------------------
 
   function disconnect() {
+    _pendingDial.forEach(function (t) { clearTimeout(t); });
+    _pendingDial.clear();
     _peers.forEach(_teardownEntry);
     _peers.clear();
 
