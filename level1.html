@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Duble Trouble — The Chamber</title>
+<title>Duble Trouble — Keepie Uppie</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -83,8 +83,6 @@
            padding:0 16px 16px; justify-content:space-between; pointer-events:none; }
   @media (pointer: coarse) { #touch { display:flex; } }
   .pad { display:flex; gap:10px; pointer-events:auto; }
-  /* 50px is about the smallest a thumb target should go — below ~44px
-     accuracy falls off badly, and these get pressed under pressure. */
   .tbtn { width:70px; height:70px; border-radius:50%; border:1px solid #45455e;
           background:rgba(40,40,58,.72); color:#d8d8ea; font-size:16px;
           display:flex; align-items:center; justify-content:center;
@@ -208,7 +206,6 @@
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
 
-  // Create background particles (stars / dust)
   const particleCount = 40;
   const particles = [];
 
@@ -217,7 +214,7 @@
       x: Math.random() * canvas.width,
       y: Math.random() * canvas.height,
       size: Math.random() * 2.5 + 0.5,
-      speed: Math.random() * 0.4 + 0.1, // Horizontal drift speed
+      speed: Math.random() * 0.4 + 0.1,
       opacity: Math.random() * 0.7 + 0.3
     });
   }
@@ -225,167 +222,82 @@
   function animateBG() {
     requestAnimationFrame(animateBG);
 
-    // Deep twilight background gradient
     const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
     grad.addColorStop(0, '#141026');
     grad.addColorStop(1, '#0d0b18');
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Update and draw moving particles
-    ctx.fillStyle = '#b19cd9'; // Soft violet tint to match your game vibe
+    ctx.fillStyle = '#b19cd9';
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
-      
-      // Move particle to the left
       p.x -= p.speed;
-      
-      // If it goes off-screen, wrap it back around to the right
       if (p.x < 0) {
         p.x = canvas.width;
         p.y = Math.random() * canvas.height;
       }
-
       ctx.globalAlpha = p.opacity;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
       ctx.fill();
     }
-    ctx.globalAlpha = 1.0; // Reset alpha
+    ctx.globalAlpha = 1.0;
   }
 
   animateBG();
 })();
 </script>
+
 <!-- ==========================================================================
-     Level 7: The Chamber — inlined here in place of level.js.
-
-     THE ROUTE
-       Bottom floor: spawn, a pit, a low wall you jump, a cannon firing back
-       along the floor, the air switch, and the box in the right-hand shaft.
-       The room above is open underneath — its lowest platform is past a solo
-       jump, so one player boosts another up. Whoever stays below hits the
-       switch; the air lifts the box up the shaft and pushes it left along
-       the ceiling, dropping it on the long platform. A player up there
-       carries it and throws it down, and the player below uses it as a step
-       to climb, cross the fire, and reach the exit.
-
-     EVERYTHING POSITIONAL IS IN THE CONFIG BLOCK BELOW — platforms, walls,
-     cannons, switch, box, goal. Edit those numbers; nothing in build() has
-     hardcoded geometry.
-
-     GOD MODE for testing is one clearly-marked block near the top and one
-     line inside the tick. Both are tagged GOD-MODE so they can be deleted
-     together.
-
-     REQUIRES netcode's level-message relay for Pause on non-host players.
-     Everything else works without it.
+     Level: Keepie Uppie — Dynamic Lane Rendering Implementation
      ========================================================================== -->
 <script>
 (function () {
 "use strict";
 
-const { StaticBody, TriggerZone, BouncingBall, Box, Player, aabbOverlap } = window.Engine;
+const { StaticBody, TriggerZone, BouncingBall } = window.Engine;
+const P = window.Engine.PHYSICS;
 
 /* ======================================================================
-   GOD-MODE — testing only. Delete this whole block and the one tagged
-   line inside the level tick to remove it entirely.
+   ARENA CONFIG
    ====================================================================== */
-const GOD = {
-  on: false,             // master switch
-  jumpVelocity: 1000,    // engine default is 560 (~92px apex)
-  invulnerable: true,    // hazards cannot kill
-  showHitboxes: false,
-};
-if (GOD.on && window.Engine.PHYSICS) {
-  window.Engine.PHYSICS.JUMP_VELOCITY = GOD.jumpVelocity;
-  console.warn('[level7] GOD MODE ON — jump ' + GOD.jumpVelocity +
-               (GOD.invulnerable ? ', invulnerable' : ''));
+function getActiveLaneCount(nw) {
+  if (nw && nw.players && nw.players.size > 0) {
+    return Math.min(Math.max(nw.players.size, 1), 6);
+  }
+  return 1; // Default to 1 for single player solo mode
 }
-/* ==================== end GOD-MODE ==================================== */
+
+const LANE_LEN   = 1100;       // inside length of a corridor, left to right
+const LANE_H     = 200;        // inside height: player 40 + room for the arc
+const WALL       = 18;         // thickness of every floor/ceiling/end wall
+const MARGIN     = 24;         // border around the whole stack
 
 /* ======================================================================
-   LAYOUT CONFIG — every position in the level, in level pixels.
-   x grows right, y grows DOWN, and an entity's x/y is its top-left corner.
+   BALL CONFIG — the feel of the juggle lives here.
    ====================================================================== */
-const LEVEL = {
-  width:  1304,
-  height: 630,
-  floorY: 540,           // the bottom floor's top surface
-  ceilY:  16,            // the room's ceiling
-};
+const BALL_D        = 26;
+const BALL_GRAVITY  = 800;    // softer than the player's 1700: more hang time
+const BOUNCE_V      = 400;     // upward speed off a head — sets the arc height
+const CEIL_DAMP     = 0.40;    // energy kept when it smacks the ceiling
+const STEER         = 2;       // how hard an off-centre header sends it sideways
+const BALL_MAX_VX   = 210;     // cap, so it can never outrun the player
+const WALL_DAMP     = 0.8;     // energy kept off an end wall
+const START_HEIGHT  = 150;     // how high above the head the ball starts
 
-// Ground strips. The space between two of them is a pit, and a pit kills.
-const FLOOR = [
-  { x: 0,   w: 320 },    // spawn side
-  { x: 450, w: 774 },    // the long run  (gap 320..450 = 130px pit)
-];
+const GAMEOVER_SECS = 2.0;     // how long the GAME OVER card holds before reset
 
-// Solid blocks: the low wall, the room shell, the shaft divider.
-// 'stopsFire: true' means a fire or cannonball touching it is destroyed.
-const WALLS = [
-  { id: 'lowWall',  x: 456,  y: 485, w: 26,  h: 55,  stopsFire: true },
-  { id: 'ceiling',  x: 550,  y: 16,  w: 690, h: 16,  stopsFire: true },
-  { id: 'rightWall',x: 1224, y: 16,  w: 16,  h: 524, stopsFire: true },
-  { id: 'leftWall', x: 550,  y: 16,  w: 16,  h: 470, stopsFire: true },
-  { id: 'shaftDiv', x: 1156, y: 100, w: 16,  h: 440, stopsFire: true },
-];
+const LAND_COLOR = '#8a5fbd';
+const LANE_COLOR = '#a778d6';
+const GOAL_COLOR = '#f0c419';
+const VIEW_MODE  = 'follow';
 
-// Platforms, bottom to top. Each is climbed from the one before it, so
-// consecutive entries need to overlap in x — climbing while moving
-// sideways barely works (see JUMP NOTES below).
-const PLATFORMS = [
-  { id: 'step1', x: 1050, y: 420, w: 114, h: 16 },   // boosted up from the floor
-  { id: 'step2', x: 560, y: 350, w: 500, h: 16 },
-  { id: 'step3', x: 710, y: 220, w: 446, h: 16 },
-  { id: 'step35', x: 620, y: 280, w: 30, h: 16 },   // long; the box lands here
-  { id: 'step4', x: 997, y: 150, w: 160, h: 16 },
-  { id: 'exit',  x: 566, y: 148, w:  94, h: 16 },   // flat hop from step4
-];
-
-// Cannons. dir -1 fires left, +1 right. 'kind' picks what comes out.
-const CANNONS = [
-  { id: 'ground', x: 1106, y: 510, dir: -1, kind: 'ball', interval: 1.8, speed: 175 },
-  { id: 'fire1',  x: 570,  y: 320, dir:  1, kind: 'fire', interval: 1.3, speed: 190 },
-  { id: 'fire2',  x: 1100,  y: 190, dir:  -1, kind: 'fire', interval: 1, speed: 160 },
-];
-
-const SWITCH_POS = { x: 920, y: 512 };
-const BOX_POS    = { x: 1196, y: 496 };
-const GOAL_POS   = { x: 580, y: 95, w: 60, h: 56 };
-
-// The air. Shaft is the vertical lift; the ceiling run carries the box left
-// and lets go once it is past releaseX, so it falls onto step3.
-const AIR = {
-  shaftL: 1156, shaftR: 1224,
-  liftSpeed: 210,
-  pushSpeed: 190,
-  releaseX: 1156,
-};
-
-const BOX_D = 44;
-const BALL_D = 20;
-const FIRE_D = 16;
-const CANNON_LEN = 52, CANNON_H = 30;
-/* ==================== end LAYOUT CONFIG =============================== */
-
-/* ---- JUMP NOTES -------------------------------------------------------
-   JUMP_VELOCITY 560 against GRAVITY 1700 gives a ~92px apex and ~171px of
-   flat distance at MOVE_SPEED 260. Climbing costs horizontal reach fast:
-   landing 70px higher leaves only ~44px of sideways travel. So platforms
-   you climb between should sit directly above one another. A player is 40px
-   tall, so standing on a teammate reaches ~132px, and standing on a box
-   (44px) reaches ~136px.
-   -------------------------------------------------------------------- */
-
-const VIEW_MODE = 'follow';
-const LAND_COLOR  = '#a778d6';
-const WALL_COLOR  = '#8a5fbd';
-const GOAL_COLOR  = '#f0c419';
-const FIRE_COLOR  = '#e8603c';
-const IRON_COLOR  = '#7a5240';
-const SWITCH_OFF  = '#5a4a72';
-const SWITCH_ON   = '#f0c419';
+/* ---- Geometry Calculation Helpers ------------------- */
+const LANE_PITCH  = LANE_H + WALL;
+const ARENA_W     = MARGIN * 2 + WALL * 2 + LANE_LEN;
+const laneInnerY  = i => MARGIN + WALL + i * LANE_PITCH;  // ceiling underside
+const laneFloorY  = i => laneInnerY(i) + LANE_H;          // floor top surface
+const LANE_X      = MARGIN + WALL;
 
 const IS_HOST = (function () {
   try {
@@ -400,60 +312,43 @@ const RELAY_OK = IS_HOST
   ? typeof (NC.Host && NC.Host.broadcastLevelMsg) === 'function'
   : typeof (NC.Client && NC.Client.sendLevelMsg) === 'function';
 
-/* ---- Hazards ---------------------------------------------------------
-   Each subclasses BouncingBall so netcode's codec syncs it by instanceof,
-   colour included. Every movement method is stubbed; the level tick drives
-   all of it, so there is no engine gravity or bounce to fight.
-   -------------------------------------------------------------------- */
 const NOOP = function () {};
-function inert(C) {
-  C.prototype.update = NOOP; C.prototype.step = NOOP; C.prototype.tick = NOOP;
-  C.prototype.simulate = NOOP; C.prototype.integrate = NOOP;
-}
-
-class Shot extends BouncingBall {
-  // One class for both cannonballs and fire — they behave identically
-  // (travel straight, die on a wall, kill on contact) and differ only in
-  // size, colour, and which art branch draws them.
-  constructor(x, y, vx, isFire) {
-    const d = isFire ? FIRE_D : BALL_D;
-    super(x, y, d, d, {
-      vx: vx, vy: 0, friction: 0, minSpeed: Math.abs(vx),
-      killsPlayers: false,
-      color: isFire ? FIRE_COLOR : IRON_COLOR,
+class Ball extends BouncingBall {
+  constructor(x, y, color) {
+    super(x, y, BALL_D, BALL_D, {
+      vx: 0, vy: 0, friction: 0, minSpeed: 0, killsPlayers: false, color: color,
     });
     this.solid = false;
-    this.kind = isFire ? 'fire' : 'cannonball';
-    this.speed = vx;
+    this.kind = 'juggle';
   }
 }
-class Switch extends BouncingBall {
-  constructor(x, y) {
-    super(x, y, 28, 28, { vx: 0, vy: 0, friction: 0, minSpeed: 0, killsPlayers: false, color: SWITCH_OFF });
-    this.solid = false; this.kind = 'switch'; this.active = false;
-  }
-}
-class Cannon extends BouncingBall {
-  // Visual only, but synced so clients see it in place with no messaging.
-  constructor(x, y, dir) {
-    super(x, y, CANNON_LEN, CANNON_H, { vx: 0, vy: 0, friction: 0, minSpeed: 0, killsPlayers: false, color: IRON_COLOR });
-    this.solid = false; this.kind = 'cannon'; this.dir = dir;
-  }
-}
-[Shot, Switch, Cannon].forEach(inert);
+Ball.prototype.update = NOOP; Ball.prototype.step = NOOP; Ball.prototype.tick = NOOP;
+Ball.prototype.simulate = NOOP; Ball.prototype.integrate = NOOP;
+
+const HUD = { over: false, msg: '', done: 0, total: 0 };
+window.LevelJuggle = { hud: HUD };
 
 window.Level = {
-  WIDTH: LEVEL.width,
-  HEIGHT: LEVEL.height,
+  WIDTH: ARENA_W,
+  HEIGHT: MARGIN * 2 + WALL + 1 * LANE_PITCH, // Dynamic default, recalculated in build()
   VIEW_MODE: VIEW_MODE,
 
   spawnPoint(slot) {
-    return { x: 40 + (slot % 4) * 32, y: LEVEL.floorY - 40 - Math.floor(slot / 4) * 44 };
+    const activeLanes = (window.LevelJuggle && window.LevelJuggle.activeLanes) || 1;
+    const lane = slot % activeLanes;
+    return { x: LANE_X + 40, y: laneFloorY(lane) - 40 };
   },
 
   build(world, nw) {
-    world.deathY = LEVEL.height + 80;
-    world.cameraOpts = { blockBottom: false };     // the pit has to be lethal
+    const activeLanes = getActiveLaneCount(nw);
+    window.LevelJuggle.activeLanes = activeLanes;
+
+    // Dynamically size the arena height for the current player count
+    const dynamicArenaH = MARGIN * 2 + WALL + activeLanes * LANE_PITCH;
+    window.Level.HEIGHT = dynamicArenaH;
+
+    world.deathY = dynamicArenaH + 400;
+    world.cameraOpts = { viewW: 1100, viewH: 620 };
 
     function slab(x, y, w, h, color) {
       const b = new StaticBody(x, y, w, h);
@@ -462,49 +357,41 @@ window.Level = {
       return b;
     }
 
-    // Floor, walls, platforms — all straight from the config.
-    FLOOR.forEach(function (f) {
-      slab(f.x, LEVEL.floorY, f.w, LEVEL.height - LEVEL.floorY);
-    });
+    const goals = [];
+    const lanes = [];
 
-    const fireStoppers = [];
-    WALLS.forEach(function (w) {
-      const b = slab(w.x, w.y, w.w, w.h, WALL_COLOR);
-      if (w.stopsFire) fireStoppers.push(b);
-    });
+    // Build horizontal floor/ceiling slabs matching activeLanes count
+    for (let i = 0; i <= activeLanes; i++) {
+      slab(MARGIN, MARGIN + i * LANE_PITCH, WALL * 2 + LANE_LEN, WALL);
+    }
 
-    PLATFORMS.forEach(function (p) {
-      slab(p.x, p.y, p.w, p.h);
-    });
+    // Build left/right walls and exit goals for active lanes only
+    for (let i = 0; i < activeLanes; i++) {
+      slab(MARGIN, laneInnerY(i), WALL, LANE_H);                   // left end
+      slab(MARGIN + WALL + LANE_LEN, laneInnerY(i), WALL, LANE_H); // right end
 
-    const sw = new Switch(SWITCH_POS.x, SWITCH_POS.y);
-    world.add(sw);
+      lanes.push({
+        top:    laneInnerY(i),
+        floor:  laneFloorY(i),
+        left:   LANE_X,
+        right:  LANE_X + LANE_LEN,
+      });
 
-    const liftBox = new Box(BOX_POS.x, BOX_POS.y, BOX_D, BOX_D);
-    world.add(liftBox);
-    nw.boxes.push(liftBox);
+      const gh = 90, gw = 64;
+      const goal = new TriggerZone(LANE_X + LANE_LEN - gw - 10, laneFloorY(i) - gh,
+                                   gw, gh, { effect: 'goal', kind: 'exit' });
+      goal.color = GOAL_COLOR;
+      world.add(goal);
+      nw.triggers.push(goal);
+      goals.push(goal);
+    }
 
-    // Every cannon is a real object, and its shots leave from its muzzle —
-    // so nothing ever appears out of thin air beside a wall.
-    const cannons = CANNONS.map(function (c) {
-      const ent = new Cannon(c.x, c.y, c.dir);
-      world.add(ent);
-      return { cfg: c, ent: ent, t: c.interval };   // first shot right away
-    });
+    world.levelBounds = { minX: 0, minY: 0, maxX: ARENA_W, maxY: dynamicArenaH };
+    nw.winCondition = { type: 'reach-goal', mode: 'each', goals: goals };
 
-    const goal = new TriggerZone(GOAL_POS.x, GOAL_POS.y, GOAL_POS.w, GOAL_POS.h,
-                                 { effect: 'goal', kind: 'exit' });
-    goal.color = GOAL_COLOR;
-    world.add(goal);
-    nw.triggers.push(goal);
-
-    world.levelBounds = { minX: 0, minY: 0, maxX: LEVEL.width, maxY: LEVEL.height };
-    nw.winCondition = { type: 'reach-goal', mode: 'each', goals: [goal] };
-
-    /* ---- Pause: a total stop, hazards and all -------------------------- */
-    let paused = false;
-    let pausedMirror = false;
-    window.Level7Pause = {
+    /* ---- Pause --------------------------------------------------------- */
+    let paused = false, pausedMirror = false;
+    window.LevelPause = {
       isPaused: function () { return IS_HOST ? paused : pausedMirror; },
       toggle: function () {
         if (IS_HOST) {
@@ -524,129 +411,129 @@ window.Level = {
       };
     } else if (RELAY_OK) {
       NC.Client.onLevelMsg = function (payload) {
-        if (payload && payload.k === 'pause') pausedMirror = !!payload.on;
+        if (!payload) return;
+        if (payload.k === 'pause') pausedMirror = !!payload.on;
+        else if (payload.k === 'st') {
+          HUD.over = !!payload.o; HUD.msg = payload.m || '';
+          HUD.done = payload.d || 0; HUD.total = payload.n || 0;
+        }
       };
     }
 
-    /* ---- Level tick ---------------------------------------------------- */
-    let boxDelivered = false;
+    /* ================= HOST-ONLY GAME STATE ============================ */
+    const balls = new Map();     // slot -> Ball
+    let overTimer = 0;           // > 0 while the GAME OVER card is up
+    let message = '';
+    let netAccum = 0;
     let lastGen = world.resetGeneration;
-    const engineStep = world.step.bind(world);
 
-    /* ---- What a reset has to undo ---------------------------------------
-       world.add() captures an entity's spawn POSITION and VELOCITY, so
-       resetLevel() restores those on its own. It knows nothing about custom
-       fields, which means the switch's `active` flag and its colour survive
-       a reset and leave the air permanently on — the level is unwinnable-in-
-       reverse after the first attempt. Same for boxDelivered and the cannon
-       cadences, which are plain closure variables the engine cannot see.
-
-       Everything the level itself owns is put back here.
-       ------------------------------------------------------------------ */
-    function resetLevelState() {
-      sw.active = false;
-      sw.color = SWITCH_OFF;
-      boxDelivered = false;
-      for (let i = 0; i < cannons.length; i++) cannons[i].t = cannons[i].cfg.interval;
-
-      // Shots in flight are not spawn-state either — they were created after
-      // build(), so resetLevel() leaves them mid-air.
-      const all = world.entities;
-      for (let i = all.length - 1; i >= 0; i--) {
-        if (all[i] instanceof Shot) world.remove(all[i]);
-      }
+    function clearBalls() {
+      for (const b of balls.values()) world.remove(b);
+      balls.clear();
     }
 
+    function laneOf(slot) { return lanes[slot % activeLanes]; }
+
+    function serve(slot, p) {
+      const lane = laneOf(slot);
+      const y = Math.max(lane.top + 2, p.y - START_HEIGHT);
+      const b = new Ball(p.x + p.w / 2 - BALL_D / 2, y, p.color);
+      world.add(b);
+      balls.set(slot, b);
+    }
+
+    function broadcast() {
+      HUD.over = overTimer > 0; HUD.msg = message;
+      if (!RELAY_OK || !IS_HOST) return;
+      try {
+        NC.Host.broadcastLevelMsg({
+          k: 'st', o: overTimer > 0, m: message, d: HUD.done, n: HUD.total,
+        });
+      } catch (e) {}
+    }
+
+    const engineStep = world.step.bind(world);
     world.step = function (dt) {
-      if (IS_HOST && paused) return;      // nothing advances at all
+      if (IS_HOST && paused) return;
+
+      if (IS_HOST && overTimer > 0) {
+        overTimer -= dt;
+        if (overTimer <= 0) {
+          overTimer = 0;
+          message = '';
+          world.pendingReset = true;
+        }
+        broadcast();
+        return;
+      }
+
       engineStep(dt);
       if (!IS_HOST || !(dt > 0)) return;
 
-      // A reset bumps resetGeneration. Clients see it through the snapshot,
-      // but only the host runs this tick, so the host is what puts the
-      // level's own state back — and the restored switch colour reaches
-      // clients through the ordinary sync, no message needed.
       if (world.resetGeneration !== lastGen) {
         lastGen = world.resetGeneration;
-        resetLevelState();
+        clearBalls();
       }
 
-      const players = [];
-      for (const p of nw.players.values()) if (p && !p.dead && !p.removed) players.push(p);
+      const live = [];
+      for (const [slot, p] of nw.players) {
+        if (p && !p.dead && !p.removed) live.push([slot, p]);
+      }
+      HUD.total = live.length;
 
-      function killTouching(e) {
-        if (GOD.on && GOD.invulnerable) return;   // GOD-MODE
-        for (let j = 0; j < players.length; j++) {
-          const p = players[j];
-          if (p.invulnerableTimer > 0) continue;
-          if (!aabbOverlap(e, p)) continue;
-          if (typeof world.killPlayer === 'function') world.killPlayer(p);
-          else { p.dead = true; world.pendingReset = true; }
+      for (let i = 0; i < live.length; i++) {
+        if (!balls.has(live[i][0])) serve(live[i][0], live[i][1]);
+      }
+
+      for (const slot of Array.from(balls.keys())) {
+        if (!nw.players.has(slot)) { world.remove(balls.get(slot)); balls.delete(slot); }
+      }
+
+      for (let i = 0; i < live.length; i++) {
+        const slot = live[i][0], p = live[i][1];
+        const b = balls.get(slot);
+        if (!b) continue;
+        const lane = laneOf(slot);
+
+        // --- gravity and travel ---
+        b.vy += BALL_GRAVITY * dt;
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+
+        // --- end walls ---
+        if (b.x < lane.left) { b.x = lane.left; b.vx = Math.abs(b.vx) * WALL_DAMP; }
+        if (b.x + b.w > lane.right) { b.x = lane.right - b.w; b.vx = -Math.abs(b.vx) * WALL_DAMP; }
+
+        // --- ceiling ---
+        if (b.y < lane.top) { b.y = lane.top; b.vy = Math.abs(b.vy) * CEIL_DAMP; }
+
+        // --- the header ---
+        const headTop = p.y;
+        const overlapX = (b.x + b.w > p.x) && (b.x < p.x + p.w);
+        const onHead = overlapX && b.vy > 0 &&
+                       (b.y + b.h) >= headTop && (b.y + b.h) <= headTop + 18;
+        if (onHead) {
+          b.y = headTop - b.h;
+          b.vy = -BOUNCE_V;
+          const off = (b.x + b.w / 2) - (p.x + p.w / 2);
+          b.vx += off * STEER;
+          if (b.vx > BALL_MAX_VX) b.vx = BALL_MAX_VX;
+          if (b.vx < -BALL_MAX_VX) b.vx = -BALL_MAX_VX;
+        }
+
+        // --- the floor: one drop ends it for everyone ---
+        if (b.y + b.h >= lane.floor) {
+          b.y = lane.floor - b.h;
+          b.vy = 0; b.vx = 0;
+          message = 'Ball dropped in lane ' + ((slot % activeLanes) + 1) + ' — GAME OVER';
+          overTimer = GAMEOVER_SECS;
+          broadcast();
+          return;
         }
       }
 
-      // Switch: one touch, on for good.
-      if (!sw.active) {
-        for (let i = 0; i < players.length; i++) {
-          if (aabbOverlap(sw, players[i])) { sw.active = true; sw.color = SWITCH_ON; break; }
-        }
-      }
-
-      // Fire every cannon on its own cadence, from its own muzzle.
-      for (let i = 0; i < cannons.length; i++) {
-        const c = cannons[i];
-        c.t += dt;
-        while (c.t >= c.cfg.interval) {
-          c.t -= c.cfg.interval;
-          const isFire = c.cfg.kind === 'fire';
-          const d = isFire ? FIRE_D : BALL_D;
-          const muzzleX = c.cfg.dir < 0 ? c.ent.x - d - 2 : c.ent.x + c.ent.w + 2;
-          const muzzleY = c.ent.y + CANNON_H / 2 - d / 2;
-          world.add(new Shot(muzzleX, muzzleY, c.cfg.dir * c.cfg.speed, isFire));
-        }
-      }
-
-      // Shots: travel, die on any fire-stopping wall, kill on contact.
-      const all = world.entities;
-      for (let i = all.length - 1; i >= 0; i--) {
-        const e = all[i];
-        if (!(e instanceof Shot)) continue;
-
-        e.vy = 0;
-        e.vx = e.speed;
-        e.x += e.vx * dt;
-
-        let stopped = false;
-        for (let k = 0; k < fireStoppers.length; k++) {
-          if (aabbOverlap(e, fireStoppers[k])) { stopped = true; break; }
-        }
-        if (stopped || e.x + e.w < 0 || e.x > LEVEL.width) { world.remove(e); continue; }
-
-        killTouching(e);
-      }
-
-      /* -- The air ---------------------------------------------------------
-         Up the shaft, left along the ceiling, released past AIR.releaseX so
-         it drops onto the long platform. Delivery is all the air does: a
-         player has to carry the box and throw it down. A carried box is
-         ignored, so the current cannot fight someone aiming a throw.
-         ------------------------------------------------------------------ */
-      if (!sw.active) return;
-
-      const riders = players.slice();
-      if (!liftBox.carried && !boxDelivered) riders.push(liftBox);
-
-      for (let i = 0; i < riders.length; i++) {
-        const r = riders[i];
-        const cx = r.x + r.w / 2;
-        const inShaft = cx > AIR.shaftL && cx < AIR.shaftR;
-        const atCeiling = r.y <= LEVEL.ceilY + 40;
-
-        if (inShaft && !atCeiling) r.vy = -AIR.liftSpeed;
-        else if (atCeiling && cx > AIR.releaseX) { r.vy = 0; r.vx = -AIR.pushSpeed; }
-      }
-
-      if (!boxDelivered && liftBox.x + liftBox.w / 2 <= AIR.releaseX) boxDelivered = true;
+      netAccum += dt;
+      if (netAccum >= 0.25) { netAccum = 0; broadcast(); }
     };
   },
 };
@@ -655,76 +542,82 @@ window.Level = {
 </script>
 
 <!-- ==========================================================================
-     Level 7 controls + custom art — Back and Pause in the same #voiceBar
-     .vbtn style level 6 established, plus richer canvas art for fire,
-     cannonballs, the switch, and both boxes.
+     Keepie Uppie controls + HUD
      ========================================================================== -->
 <script>
 (function () {
 "use strict";
 
-/* ---- Controls ---------------------------------------------------------
-   Same pattern as level 6: buttons live in the shell's existing #voiceBar
-   with the .vbtn class, so they read as one control group with the mic and
-   gear rather than a second competing bar. This is the standard going
-   forward — Back plus whatever the level's own control is (Restart, Pause,
-   etc.) — all in #voiceBar.
-   -------------------------------------------------------------------- */
-(function controls() {
-  function mkVbtn(glyph, label, onclick) {
-    const b = document.createElement('button');
-    b.className = 'vbtn';
-    b.type = 'button';
-    b.innerHTML = glyph;
-    b.title = label;
-    b.setAttribute('aria-label', label);
-    b.onclick = onclick;
-    return b;
-  }
+function mkVbtn(glyph, label, onclick) {
+  const b = document.createElement('button');
+  b.className = 'vbtn'; b.type = 'button';
+  b.innerHTML = glyph; b.title = label;
+  b.setAttribute('aria-label', label);
+  b.onclick = onclick;
+  return b;
+}
 
-  const bar = document.getElementById('voiceBar');
-  if (!bar) return;
+const bar = document.getElementById('voiceBar');
+if (!bar) return;
 
-  const pauseBtn = mkVbtn('&#10074;&#10074;', 'Pause', function () {
-    if (window.Level7Pause) window.Level7Pause.toggle();
-  });
+const pauseBtn = mkVbtn('&#10074;&#10074;', 'Pause', function () {
+  if (window.LevelPause) window.LevelPause.toggle();
+});
+const back = mkVbtn('&#8592;', 'Leave the level', function () {
+  try { window.Netcode.Host.prepareHandoff(); } catch (e) {}
+  location.href = 'index.html';
+});
+bar.appendChild(pauseBtn);
+bar.appendChild(back);
 
-  const back = mkVbtn('&#8592;', 'Leave the level', function () {
-    try { window.Netcode.Host.prepareHandoff(); } catch (e) {}
-    location.href = 'index.html';
-  });
+function centreCard(html, bg) {
+  const el = document.createElement('div');
+  el.style.cssText =
+    'position:fixed;inset:0;z-index:62;display:none;align-items:center;' +
+    'justify-content:center;background:' + bg + ';backdrop-filter:blur(3px);' +
+    'font-family:system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;';
+  el.innerHTML =
+    '<div style="padding:24px 44px;border-radius:16px;background:rgba(24,19,34,.95);' +
+    'border:1px solid rgba(255,255,255,.16);color:#e9e3f2">' + html + '</div>';
+  document.body.appendChild(el);
+  return el;
+}
 
-  bar.appendChild(pauseBtn);
-  bar.appendChild(back);
+const overEl = centreCard(
+  '<div style="font:700 34px/1.1 inherit;color:#ff8a7a;letter-spacing:.04em">GAME OVER</div>' +
+  '<div id="overWhy" style="margin-top:8px;font-size:14px;color:#c9c1dd"></div>' +
+  '<div style="margin-top:6px;font-size:12px;color:#a79fbd">One dropped ball ends the run for everyone.</div>',
+  'rgba(30,10,14,.6)');
 
-  // "Paused" banner — visible to everyone, not just the host, since the
-  // freeze itself is total and gives no other visual cue that anything
-  // has happened rather than lagged.
-  const banner = document.createElement('div');
-  banner.textContent = 'II Paused';
-  banner.style.cssText =
-    'position:fixed;top:44px;left:50%;transform:translateX(-50%);z-index:61;' +
-    'display:none;padding:7px 16px;border-radius:999px;' +
-    'background:rgba(24,19,34,.85);border:1px solid rgba(255,255,255,.16);' +
-    'color:#e9e3f2;font:600 13px/1 system-ui,-apple-system,Segoe UI,sans-serif;' +
-    'letter-spacing:.04em;backdrop-filter:blur(6px);';
-  document.body.appendChild(banner);
+const pauseEl = centreCard(
+  '<div style="font:700 30px/1.1 inherit;letter-spacing:.04em">GAME IS PAUSED</div>' +
+  '<div style="margin-top:8px;font-size:13px;color:#a79fbd">' +
+  'Paused for everyone &mdash; press &#10074;&#10074; again to resume.</div>',
+  'rgba(14,11,24,.55)');
+pauseEl.style.zIndex = '63';
 
-  (function loop() {
-    try {
-      const on = window.Level7Pause && window.Level7Pause.isPaused();
-      banner.style.display = on ? 'block' : 'none';
-      pauseBtn.style.opacity = on ? '0.65' : '1';
-    } catch (e) {}
-    requestAnimationFrame(loop);
-  })();
+(function loop() {
+  try {
+    const p = window.LevelPause && window.LevelPause.isPaused();
+    pauseEl.style.display = p ? 'flex' : 'none';
+    pauseBtn.style.opacity = p ? '0.65' : '1';
+
+    const h = window.LevelJuggle && window.LevelJuggle.hud;
+    if (h) {
+      overEl.style.display = h.over ? 'flex' : 'none';
+      const why = document.getElementById('overWhy');
+      if (why) why.textContent = h.msg || '';
+    }
+  } catch (e) {}
+  requestAnimationFrame(loop);
 })();
 
-/* ---- Custom art --------------------------------------------------------
-   Added as extra branches in the shell's per-entity draw dispatch, right
-   alongside its existing kind checks — the same anchor point used for the
-   level 5 ball/bomb art.
-   -------------------------------------------------------------------- */
+window.addEventListener('keydown', function (ev) {
+  if (ev.code === 'Escape' || ev.code === 'KeyP') {
+    if (window.LevelPause) window.LevelPause.toggle();
+  }
+});
+
 })();
 </script>
 
@@ -744,8 +637,6 @@ const { Box, Player } = window.Engine;
 
 const $ = id => document.getElementById(id);
 
-// Where "back to lobby" goes. Relative to this page — adjust if level
-// pages ever move into a subfolder relative to the lobby.
 const LOBBY_URL = 'lobby.html';
 const boot = $('boot'), bootStatus = $('bootStatus'), stage = $('stage'),
       hudEl = $('hud'), canvas = $('game');
@@ -761,11 +652,7 @@ window.bindTouchButton($('btnAction'), input, 'action');
 
 let side = null, peer = null, running = false, myPeerId = null;
 
-// Matches the (pointer: coarse) media query that reveals #touch, so the
-// view lift and the buttons can never disagree about whether the pad is
-// on screen.
 const TOUCH_UI = window.matchMedia('(pointer: coarse)').matches;
-// How far up the world is nudged to clear the control pad, in screen px.
 const TOUCH_VIEW_LIFT = 40;
 
 const animStates = new WeakMap();
@@ -779,16 +666,6 @@ function resize() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-/* ---------- view rect ----------
-   The region of level-space the window shows. In 'whole' mode that's the
-   entire level (the original letterbox behaviour). In 'follow' mode it's
-   engine.js's Camera, which already tracks the average of the live
-   players and is clamped to levelBounds — it was being simulated and
-   synced all along (nw.cameras[0], a static-lifecycle entry in netcode's
-   TYPE_REGISTRY with blended x/y), it just was never rendered through.
-   Reading it rather than recomputing a follow point locally means host
-   and clients frame the shot identically, and the camera's collision
-   walls line up with what you can actually see. */
 function viewRect() {
   if (window.Level.VIEW_MODE === 'follow' && side && side.nw &&
       side.nw.cameras && side.nw.cameras[0]) {
@@ -800,27 +677,10 @@ function viewRect() {
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(resize, 100));
 
-// ---- mobile fullscreen on rotate --------------------------------------
-// Touch devices only. Turning to landscape goes fullscreen (the browser
-// chrome eats a lot of the width this shared-screen level needs);
-// turning back to portrait, or leaving fullscreen by any other route,
-// puts the device back exactly how it was.
-//
-// The catch: requestFullscreen() needs a user gesture, and an
-// orientationchange event does NOT count as one in Chrome/Firefox. So
-// when the direct attempt is rejected we arm a one-shot listener and go
-// fullscreen on the player's very next touch instead — which in practice
-// is immediate, since they rotated in order to play. iOS Safari on
-// iPhone has no element fullscreen at all; there the promise rejects,
-// the armed touch also fails, and nothing breaks — the page just stays
-// as it is. webkitRequestFullscreen is included for iPad and older
-// WebKit.
 const isTouch = window.matchMedia('(pointer: coarse)').matches;
 const isLandscape = () => window.matchMedia('(orientation: landscape)').matches;
 const fsEl = () => document.fullscreenElement || document.webkitFullscreenElement || null;
 
-// What the orientation lock was before we touched it, so exiting can put
-// it back rather than just guessing 'portrait'. null = never locked.
 let priorOrientation = null;
 let armed = false;
 
@@ -828,7 +688,6 @@ function lockLandscape() {
   const o = screen.orientation;
   if (!o || typeof o.lock !== 'function') return;
   if (priorOrientation === null) priorOrientation = o.type || null;
-  // Rejects on desktop and on browsers that gate it — harmless either way.
   o.lock('landscape').catch(() => {});
 }
 
@@ -863,7 +722,6 @@ function enterFullscreen() {
   if (p && typeof p.then === 'function') {
     p.then(lockLandscape).catch(armGesture);
   } else {
-    // Older WebKit returns undefined rather than a promise.
     lockLandscape();
   }
 }
@@ -883,30 +741,18 @@ function syncFullscreenToOrientation() {
 
 if (isTouch) {
   window.addEventListener('orientationchange', () => setTimeout(syncFullscreenToOrientation, 150));
-  // orientationchange is deprecated and missing on some Android builds;
-  // the media query fires reliably there. Both routes are idempotent.
   const mq = window.matchMedia('(orientation: landscape)');
   const onMq = () => syncFullscreenToOrientation();
   if (mq.addEventListener) mq.addEventListener('change', onMq);
   else if (mq.addListener) mq.addListener(onMq);
 
-  // Leaving fullscreen by any other route — swipe-down, back button, Esc
-  // — must also release the orientation lock, or the device stays stuck
-  // in landscape after the player has left the game.
   const onFsChange = () => { if (!fsEl()) restoreOrientation(); setTimeout(resize, 60); };
   document.addEventListener('fullscreenchange', onFsChange);
   document.addEventListener('webkitfullscreenchange', onFsChange);
 
-  // Already sideways when the page opened.
   if (isLandscape()) armGesture();
 }
 
-// Previous on-screen position per entity, so an arrow's heading can be
-// derived from its actual movement. Clients never receive velocity (see
-// netcode.js's Codec), so this is the only way to know which way a
-// projectile is pointing there — same technique character.js already
-// uses for its own velocity fallback. WeakMap so despawned projectiles
-// clean themselves up.
 const lastPos = new WeakMap();
 
 function roundRect(x, y, w, h, r) {
@@ -920,7 +766,6 @@ function roundRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
-// A real arrow: shaft + head + fletching, rotated to face its heading.
 function drawArrow(x, y, w, h, angle) {
   const cx = x + w / 2, cy = y + h / 2;
   const len = Math.max(w, h);
@@ -928,7 +773,6 @@ function drawArrow(x, y, w, h, angle) {
   ctx.translate(cx, cy);
   ctx.rotate(angle);
 
-  // shaft
   ctx.strokeStyle = '#c9a227';
   ctx.lineWidth = 2.5;
   ctx.lineCap = 'round';
@@ -937,7 +781,6 @@ function drawArrow(x, y, w, h, angle) {
   ctx.lineTo(len / 2 - 5, 0);
   ctx.stroke();
 
-  // head
   ctx.fillStyle = '#ffe08a';
   ctx.beginPath();
   ctx.moveTo(len / 2, 0);
@@ -946,7 +789,6 @@ function drawArrow(x, y, w, h, angle) {
   ctx.closePath();
   ctx.fill();
 
-  // fletching
   ctx.strokeStyle = '#e2554f';
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -964,31 +806,21 @@ function draw() {
   lastFrameAt = now;
   const t = now / 1000;
 
-
   const W = window.Level.WIDTH, H = window.Level.HEIGHT;
   const view = viewRect();
   const cw = window.innerWidth, ch = window.innerHeight;
-  // Fill the window in follow mode (max, so no letterbox bars around a
-  // small camera rect); fit the whole thing in whole-level mode (min).
+
   scale = window.Level.VIEW_MODE === 'follow'
     ? Math.max(cw / view.w, ch / view.h)
     : Math.min(cw / view.w, ch / view.h);
   offX = (cw - view.w * scale) / 2;
   offY = (ch - view.h * scale) / 2;
 
-  // On touch devices the control pad occupies the bottom strip of the
-  // window, and the action is at ground level — so a centred view puts
-  // the players right behind the buttons. Shift the whole view up by
-  // roughly half the pad's height: the characters clear the buttons, and
-  // the extra room opens up above them, where the arrows come from.
-  // Screen-space, applied after scale, so it's a constant number of
-  // pixels regardless of how far the camera is zoomed.
   if (TOUCH_UI) offY -= TOUCH_VIEW_LIFT;
 
   ctx.save();
   ctx.setTransform(canvas.width / cw, 0, 0, canvas.height / ch, 0, 0);
   
-  // Clear canvas so the 3D Three.js background shows through
   ctx.clearRect(0, 0, cw, ch);
   
   ctx.translate(offX, offY);
@@ -1006,11 +838,7 @@ function draw() {
 
   for (let i = 0; i < list.length; i++) {
     const it = list[i], e = it.entity;
-    if (e.isWindZone) continue;
-    // Camera boundary walls are invisible collision helpers, not scenery
-    // (engine.js sets isCameraWall on them) — drawing them is what put
-    // those stray rectangles on screen.
-    if (e.isCameraWall) continue;
+    if (e.isWindZone || e.isCameraWall) continue;
     const x = it.x, y = it.y;
 
     if (e instanceof Player) {
@@ -1018,9 +846,6 @@ function draw() {
       if (!anim) { anim = window.Character.createAnimState(); animStates.set(e, anim); }
       const vx = (side === Host) ? e.vx : undefined;
       const vy = (side === Host) ? e.vy : undefined;
-      // engine.js sets `dead` on the player and syncs it (see Player's
-      // snapshot contract) — character.js has a dead pose, so pass the
-      // real flag through rather than a hardcoded false.
       window.Character.update(anim, animDt, {
         x, y, vx, vy, facing: e.facing, grounded: e.grounded, dead: !!e.dead,
       });
@@ -1028,7 +853,7 @@ function draw() {
 
     } else if (e.isProjectile || e.kind === 'arrow') {
       const prev = lastPos.get(e);
-      let angle = Math.PI / 2; // falling straight down until we have a delta
+      let angle = Math.PI / 2;
       if (prev) {
         const dx = x - prev.x, dy = y - prev.y;
         if (dx * dx + dy * dy > 0.01) angle = Math.atan2(dy, dx);
@@ -1037,12 +862,21 @@ function draw() {
       lastPos.set(e, { x, y, angle });
       drawArrow(x, y, e.w, e.h, angle);
 
+    } else if (e.kind === 'juggle') {
+      const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
+      ctx.save();
+      const g = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.4, r * 0.15, cx, cy, r);
+      g.addColorStop(0, 'rgba(255,255,255,0.85)');
+      g.addColorStop(0.35, e.color);
+      g.addColorStop(1, 'rgba(0,0,0,0.55)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(cx, cy, r - 1, 0, Math.PI * 2); ctx.stroke();
+      ctx.restore();
+
     } else if (e.kind === 'death-orb') {
-      // Drawn as a sibling of the decorative orb (same size, same bob) so
-      // it doesn't announce itself as a hazard from across the level —
-      // only the colour differs, and you have to get close to read it.
-      // Host and client both run this Level.build(), so `kind` is set
-      // locally on both sides and this branch is reached identically.
       const cx = x + e.w / 2, cy = y + e.h / 2 + 3 * Math.sin(t * 2 + x * 0.05);
       const pulse = 0.5 + 0.5 * Math.sin(t * 3.4);
       ctx.save();
@@ -1056,8 +890,6 @@ function draw() {
       ctx.restore();
 
     } else if (e.kind === 'fire') {
-      // Flickering flame: a warm core with irregular tongues, animated with
-      // layered noise-ish sine terms so no two frames repeat exactly.
       const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
       const flick = t * 14 + x * 0.1;
       ctx.save();
@@ -1080,8 +912,6 @@ function draw() {
       ctx.restore();
 
     } else if (e.kind === 'cannonball') {
-      // Cast-iron look: dark sphere, a curved highlight, a faint fuse
-      // ember trailing above it as it climbs.
       const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
       ctx.save();
       const grad = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.35, r * 0.15, cx, cy, r);
@@ -1100,16 +930,10 @@ function draw() {
       ctx.restore();
 
     } else if (e.kind === 'cannon') {
-      // Iron barrel on a mount, pointed left — the direction it fires. Drawn
-      // so the muzzle sits flush with the entity's left edge, which is
-      // exactly where the balls are spawned.
       const bh = e.h * 0.62;
       const by = y + e.h - bh;
       ctx.save();
-      // Flip about the entity's centre when it fires right, so the muzzle is
-      // drawn on the side the shots actually leave from.
       if (e.dir > 0) { ctx.translate(x + e.w / 2, 0); ctx.scale(-1, 1); ctx.translate(-(x + e.w / 2), 0); }
-      // mount
       ctx.fillStyle = '#4a3428';
       ctx.beginPath();
       ctx.moveTo(x + e.w * 0.25, y + e.h);
@@ -1117,22 +941,19 @@ function draw() {
       ctx.lineTo(x + e.w * 0.68, y + e.h - e.h * 0.32);
       ctx.lineTo(x + e.w * 0.42, y + e.h - e.h * 0.32);
       ctx.closePath(); ctx.fill();
-      // barrel
+
       const g = ctx.createLinearGradient(0, by, 0, by + bh);
       g.addColorStop(0, '#8a6a52');
       g.addColorStop(0.45, e.color || '#7a5240');
       g.addColorStop(1, '#2c1f18');
       ctx.fillStyle = g;
       roundRect(x, by, e.w * 0.92, bh, 4); ctx.fill();
-      // muzzle ring
+
       ctx.fillStyle = '#241a14';
       roundRect(x, by - 1, 6, bh + 2, 3); ctx.fill();
       ctx.restore();
 
     } else if (e.kind === 'switch') {
-      // Diamond lever. Dim and static when off; once touched it locks gold
-      // and pulses gently — the level's only permanent state change, so the
-      // art should read as "solved," not as a repeating hazard.
       const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
       const on = e.color !== '#5a4a72';
       const pulse = on ? (0.6 + 0.4 * Math.sin(t * 3)) : 1;
@@ -1146,9 +967,6 @@ function draw() {
       ctx.restore();
 
     } else if (e instanceof Box) {
-      // Wood-grain crate: base fill, a few darker grain lines, a routed
-      // border. Static art (no animation) — a box should read as solid and
-      // inert, unlike the hazards around it.
       ctx.save();
       ctx.fillStyle = '#8a5a34';
       ctx.fillRect(x, y, e.w, e.h);
@@ -1163,8 +981,6 @@ function draw() {
       ctx.restore();
 
     } else if (e.isTriggerZone || e.kind === 'exit') {
-      // Goal: pulsing glow + chevron, so it reads as "the thing to reach"
-      // rather than a yellow rectangle.
       const pulse = 0.5 + 0.5 * Math.sin(t * 2.4);
       ctx.save();
       ctx.shadowColor = 'rgba(240,196,25,0.9)';
@@ -1188,7 +1004,6 @@ function draw() {
       ctx.restore();
 
     } else if (e.solid === false) {
-      // Small decorative markers — soft dot instead of a hard square.
       ctx.save();
       ctx.globalAlpha = 0.5 + 0.3 * Math.sin(t * 2 + x * 0.05);
       ctx.fillStyle = e.color;
@@ -1198,7 +1013,6 @@ function draw() {
       ctx.restore();
 
     } else {
-      // Platforms: body, lit top edge, subtle grounding shadow beneath.
       ctx.fillStyle = 'rgba(0,0,0,0.25)';
       roundRect(x + 2, y + 4, e.w, e.h, 4); ctx.fill();
       ctx.fillStyle = e.color || '#4a4a5e';
@@ -1232,14 +1046,6 @@ function hud() {
   }
 }
 
-/* ---------- countdown ----------
-   Implemented by simply NOT calling side.update(now) until it expires.
-   On the host that freezes the whole simulation — no gravity, no arrows,
-   no snapshots go out — so there is no way to die during the countdown
-   and no need to separately gate input. Clients are frozen for the same
-   reason: with no snapshots arriving there is nothing to advance to.
-   That's why this is safe to run locally on each side without syncing
-   the countdown itself over the wire. */
 const COUNTDOWN_SECS = 3;
 let countdownEndsAt = 0;
 
@@ -1262,7 +1068,6 @@ function tickCountdown(now) {
   const label = secs <= 0 ? 'GO' : String(secs);
   if (el.textContent !== label) {
     el.textContent = label;
-    // Re-trigger the pop animation on each new number.
     el.style.animation = 'none';
     void el.offsetWidth;
     el.style.animation = '';
@@ -1270,7 +1075,6 @@ function tickCountdown(now) {
   return true;
 }
 
-/* ---------- transient messages ---------- */
 let toastTimer = null;
 function showToast(msg, ms) {
   const el = $('toast');
@@ -1280,11 +1084,6 @@ function showToast(msg, ms) {
   toastTimer = setTimeout(() => el.classList.remove('on'), ms || 1400);
 }
 
-/* ---------- death / restart + exit feedback ----------
-   Both are derived from state that's already synced, so they work
-   identically on host and client without new messages: `dead` is part of
-   the player snapshot, and a player vanishing from the world is how
-   'each' mode removes someone who went through the portal. */
 let wasDead = false;
 let lastPlayerCount = -1;
 let peakPlayerCount = 0;
@@ -1298,13 +1097,9 @@ function updateFeedback() {
 
   const me = players.get(slot);
   const dead = !!(me && me.dead);
-  if (dead && !wasDead) showToast('Hit! Restarting…', 1500);
+  if (dead && !wasDead) showToast('Restarting the run…', 1400);
   wasDead = dead;
 
-  // Exit progress. peakPlayerCount is the high-water mark rather than a
-  // fixed total, because a level page can be joined mid-session and the
-  // authoritative room size isn't exposed to clients — the number of
-  // players ever seen at once is the closest honest stand-in.
   const n = players.size;
   if (n > peakPlayerCount) peakPlayerCount = n;
   if (n !== lastPlayerCount) {
@@ -1322,15 +1117,9 @@ function updateFeedback() {
     prog.classList.remove('on');
   }
 
-  // A player leaving can force the level to restart (netcode's 'each'
-  // mode won't hand out a win nobody earned — see Host.drop). That comes
-  // through as the world's reset generation ticking over while nobody
-  // died, so it needs its own message rather than the "Hit!" one.
   const gen = side === Host ? side.nw.world.resetGeneration : Client.resetGen;
   if (typeof gen === 'number') {
     if (lastResetGen >= 0 && gen !== lastResetGen && !dead) {
-      // Everyone reappearing at once means the room was rebuilt, not that
-      // one person respawned.
       if (n > lastPlayerCount) showToast('A player left — restarting.', 1800);
       peakPlayerCount = n;
     }
@@ -1357,28 +1146,16 @@ function endSession(reason) {
   $('ended').classList.add('on');
   try { if (peer && !peer.destroyed) peer.destroy(); } catch (e) {}
 }
-// Reload starts clean. Without clearing this, a reload after finishing
-// would try to resume the session we just wrote for the hand-off — and
-// on the 'done' branch that snapshot is intentionally null, which the
-// resume path can't rebuild a room from.
+
 $('endedBtn').onclick = () => {
   try { sessionStorage.removeItem('dt-session'); } catch (e) {}
   location.reload();
 };
 
-// --- level-complete hand-off ---
-// Per the HANDOFF CONTRACT (netcode.js), this writes sessionStorage
-// correctly for whichever role we are, then SHOULD navigate to
-// LEVELS[msg.next].url — but that manifest (index -> URL) is owned by
-// lobby.js, which this file doesn't have. Flagging rather than
-// guessing a URL: session state is written correctly so the actual
-// navigation line is a one-line addition once the manifest exists.
 function onLevelComplete(msg) {
   running = false;
   $('exitProg').classList.remove('on');
 
-  // Credit the local device for this level before going anywhere — it's
-  // what unlocks the next tile in the lobby grid on this browser.
   try { if (window.Progress) window.Progress.markComplete(msg.level); } catch (e) {}
 
   try {
@@ -1391,9 +1168,6 @@ function onLevelComplete(msg) {
     else { sessionStorage.setItem('dt-session', JSON.stringify(payload)); }
   } catch (e) { console.error('[handoff] failed to persist session', e); }
 
-  // Host only: detach the pagehide 'bye' broadcast BEFORE navigating, or
-  // every client is told the session ended a split second before they
-  // were going to follow us to the same page.
   if (side === Host) Host.prepareHandoff();
 
   if (msg.done) {
@@ -1436,15 +1210,9 @@ function begin(which) {
   requestAnimationFrame(frame);
 }
 
-// --- voice/settings UI, backed by voicechat-adapter.js's VoiceUI ---
 let voiceHeartbeat = null;
 
 function currentRoster() {
-  // Both sides now get the full room list, so voice is a true mesh:
-  // the host reads its own peer map; a client reads the roster the host
-  // pushes down (folded into 'welcome' on join/rejoin, re-sent on every
-  // membership change — see VOICE ROSTER in netcode.js). Game traffic is
-  // still star-only; these ids are used solely to place voice calls.
   if (side === Host) return Host.rosterIds();
   return (Client.roster && Client.roster.length) ? Client.roster
                                                   : [Client.conn.peer, myPeerId];
@@ -1491,8 +1259,6 @@ async function initVoice() {
   await window.VoiceUI.init(peer, { onSpeakingChange: renderVoicePanel, onPeerConnected: renderVoicePanel, onPeerDisconnected: renderVoicePanel });
   $('voiceBar').classList.add('on');
 
-  // Re-mesh the moment membership changes, rather than waiting up to a
-  // full heartbeat. Both sides expose the same hook.
   const onRosterChange = () => {
     window.VoiceUI.sync(currentRoster(), myPeerId);
     renderVoicePanel();
@@ -1500,9 +1266,6 @@ async function initVoice() {
   if (side === Host) Host.onRoster = onRosterChange;
   else Client.onRoster = onRosterChange;
 
-  // Heartbeat stays as the self-healing backstop: sync() is idempotent,
-  // so a roster message lost on the unreliable channel costs a couple of
-  // seconds of missing voice rather than a permanently broken call.
   voiceHeartbeat = setInterval(() => {
     window.VoiceUI.sync(currentRoster(), myPeerId);
   }, 2000);
@@ -1523,10 +1286,6 @@ $('leaveBtn').onclick = () => {
   endSession('You left the session.');
 };
 
-// PeerJS's signalling server connection can drop without the existing
-// WebRTC data channels dying — established play continues fine, but no
-// NEW peer can find us until it's back. Reconnecting keeps the room
-// joinable instead of silently going dark.
 function wirePeerRecovery() {
   if (!peer) return;
   peer.on('disconnected', () => {
@@ -1536,12 +1295,6 @@ function wirePeerRecovery() {
   });
 }
 
-// --- solo test path (no lobby exists yet to hand this off from) ---
-// Uses an AUTO-ASSIGNED peer id (never a fixed room code), so it can
-// never collide with a leftover id from a previous test run — that's
-// what "ID taken" was: a stale registration of a FIXED id (the room
-// code) from a prior session that hadn't cleared yet. This path doesn't
-// need a fixed id at all since nobody else is joining.
 function startSolo() {
   setStatus('Starting solo test…');
   peer = new Peer({ debug: 1 });
@@ -1557,9 +1310,6 @@ function startSolo() {
 }
 $('soloBtn').onclick = startSolo;
 
-// --- entry: resume-only, per HANDOFF CONTRACT item 5. No host/join UI
-// here — this page is only ever reached via hand-off from the lobby.
-// Solo test button is the escape hatch until a real lobby exists. ---
 function bootFromSession() {
   let sess = null;
   try { sess = JSON.parse(sessionStorage.getItem('dt-session') || 'null'); } catch (e) {}
@@ -1572,9 +1322,6 @@ function bootFromSession() {
 
   if (sess.role === 'host') {
     if (!sess.hostSnapshot || !sess.hostSnapshot.roomCode) {
-      // Written by a 'done' hand-off, or storage got mangled. Nothing to
-      // rebuild a room from, so offer the clean path rather than throwing
-      // deep inside restore().
       setStatus('That session has already finished.');
       $('soloBtn').style.display = 'inline-block';
       return;
@@ -1603,9 +1350,6 @@ function bootFromSession() {
       const conn = peer.connect(sess.roomCode, { reliable: false, serialization: 'json' });
       conn.on('open', () => {
         Client.rejoin(conn, sess.token, input, setStatus, endSession, onLevelComplete);
-        // Early warning of a degrading path — Client widens its
-        // interpolation buffer rather than stuttering once packets
-        // actually start arriving late.
         const pc = conn.peerConnection;
         if (pc) {
           pc.addEventListener('iceconnectionstatechange', () => {
