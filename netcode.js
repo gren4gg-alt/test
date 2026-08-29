@@ -153,6 +153,17 @@ function maskToState(m) {
    curating which fields it wants per type) is exactly the coupling this
    registry exists to remove.
 
+   EXTRAFIELDS — the escape hatch for the above. A few fields matter on
+   the wire but have no business in engine.js's getSyncState(): a
+   dynamic entity's w/h/color/kind, which the client cannot know because
+   (unlike a static entity) it never constructs one itself and so never
+   sees the constructor args. Listing them in a type's `extraFields`
+   makes encode() append them to that type's payload. Keep the list to
+   values that are genuinely constant per entity — they're re-sent every
+   snapshot, which is what makes them self-healing against a dropped
+   packet and against a client that joined late, but also means a field
+   that changes per tick belongs in getSyncState() proper, not here.
+
    LIFECYCLE — the one thing that legitimately differs per type:
      'static'  — built once at level-load, count fixed for the level's
                  lifetime (box, platform, plate, trigger, spawner). Key is
@@ -189,25 +200,29 @@ const TYPE_REGISTRY = [
     type: 'projectile', lifecycle: 'dynamic',
     source: nw => nw.world.entities.filter(e => e.isProjectile),
     blendFields: ['x', 'y'],
+    extraFields: ['w', 'h', 'color', 'kind'],
     // Client-side materialization: NOT a real engine.js Projectile — the
     // client never simulates, so there's nothing to construct FROM. Just
     // enough of a plain object for the renderer to draw, filled in by
     // applySyncState-equivalent field assignment as snapshots arrive.
+    // These values are now only a FALLBACK for the frame between an
+    // entity first appearing and its state being assigned — the real
+    // size/colour/kind arrive over the wire via extraFields above.
     makeLocal: id => ({ id, w: 8, h: 20, color: '#d8d8e0', kind: 'arrow' }),
   },
   {
     type: 'ball', lifecycle: 'dynamic',
     source: nw => nw.world.entities.filter(e => e.isBouncingBall),
     blendFields: ['x', 'y'],
-    // Same client-materialization reasoning as 'projectile' above — the
-    // client never simulates, so this is just enough of a plain object
-    // for the renderer to draw. w/h/color are cosmetic-only and never
-    // read by physics, so a level using a non-default ball size/color
-    // (BouncingBall's `w`/`h`/config.color) will render slightly wrong
-    // here until this placeholder is updated to match — worth wiring a
-    // real size/color through if a level ever needs balls to look
-    // different from each other; today's single default is fine since
-    // nothing does yet.
+    extraFields: ['w', 'h', 'color', 'kind'],
+    // Same client-materialization reasoning as 'projectile' above.
+    // w/h/color are never read by PHYSICS, but they are not therefore
+    // cosmetic: a colour-matched level (level 5) makes a hazard kill or
+    // defuse based on whether its colour matches the player's, so a
+    // client rendering the host's ball in the wrong colour shows a
+    // player a lethal hazard as a safe one. They're synced via
+    // extraFields above; the literals below are only the fallback for
+    // the frame between first appearance and first state assignment.
     makeLocal: id => ({ id, w: 20, h: 20, color: '#e0c845', kind: 'ball' }),
   },
   {
@@ -266,12 +281,72 @@ function isSafeSyncState(s) {
   return true;
 }
 
+/* ===========================================================================
+   LEVEL MESSAGE PAYLOAD VALIDATION
+   ---------------------------------------------------------------------------
+   The level channel (see Host.broadcastLevelMsg / Client.sendLevelMsg) is
+   deliberately schemaless — netcode has no idea what a level wants to say,
+   and adding one is supposed to require zero changes here. But schemaless
+   is not the same as unchecked: this is the one path where wire data is
+   handed to level code, which will not be written defensively, so it gets
+   bounded before it's passed on.
+
+   isSafeSyncState is too strict to reuse (it rejects nesting outright,
+   which would make "arbitrary payload" a lie). So this is the same
+   primitive whitelist, extended to allow nested objects and arrays down
+   to a fixed depth with a fixed total node budget. What it still rejects:
+   functions, NaN/Infinity, long strings, cycles (via the depth cap), and
+   anything large enough to be a memory-pressure attempt. MAX_MSG_BYTES
+   already caps the raw wire size before this ever runs; this stops a
+   small-but-pathological payload (deeply nested, or thousands of tiny
+   keys) from becoming the level's problem.
+   =========================================================================== */
+const LVL_MAX_DEPTH = 6, LVL_MAX_NODES = 256, LVL_MAX_KEYS = 64;
+function isSafeLevelPayload(v, depth, budget) {
+  depth = depth || 0;
+  budget = budget || { n: 0 };
+  if (++budget.n > LVL_MAX_NODES) return false;
+  if (isSafePrimitive(v)) return true;
+  if (depth >= LVL_MAX_DEPTH) return false;
+  if (Array.isArray(v)) {
+    if (v.length > LVL_MAX_KEYS) return false;
+    for (const item of v) if (!isSafeLevelPayload(item, depth + 1, budget)) return false;
+    return true;
+  }
+  if (v && typeof v === 'object') {
+    let keys = 0;
+    for (const k in v) {
+      if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
+      if (++keys > LVL_MAX_KEYS) return false;
+      if (k.length > 64) return false;
+      if (!isSafeLevelPayload(v[k], depth + 1, budget)) return false;
+    }
+    return true;
+  }
+  return false;   // function, symbol, undefined
+}
+
 const Codec = {
   encode(nw, tick) {
     const types = {};
     for (const reg of TYPE_REGISTRY) {
       const arr = [];
-      for (const e of regSource(reg, nw)) arr.push([regKey(reg, e), e.getSyncState()]);
+      for (const e of regSource(reg, nw)) {
+        const state = e.getSyncState();
+        // Registry-declared cosmetic fields (see `extraFields` in
+        // TYPE_REGISTRY). Appended here rather than added to engine.js's
+        // getSyncState() so this stays a netcode concern — nothing else
+        // in the project pays for a field only the wire needs.
+        // `undefined` is skipped: it isn't a safe wire value (see
+        // isSafePrimitive) and an entity that doesn't define the field
+        // should simply fall back to makeLocal's default.
+        if (reg.extraFields) {
+          for (const f of reg.extraFields) {
+            if (e[f] !== undefined) state[f] = e[f];
+          }
+        }
+        arr.push([regKey(reg, e), state]);
+      }
       types[reg.type] = arr;
     }
     return { t: tick, g: nw.world.resetGeneration, types };
@@ -1229,6 +1304,46 @@ const Host = {
     this.recomputeLobby();
   },
 
+  /* =========================================================================
+     LEVEL MESSAGE CHANNEL
+     -------------------------------------------------------------------------
+     An escape hatch for level pages that need to say something to each
+     other that the snapshot protocol doesn't cover — a puzzle's bespoke
+     state, a cosmetic cue, a level-specific vote. netcode neither reads
+     nor understands the payload; it validates its SHAPE (see
+     isSafeLevelPayload) and hands it on.
+
+     WHAT THIS IS NOT: a way around host authority. The host still owns the
+     simulation, and a client message arriving here is a REQUEST, not a
+     fact — it carries the sender's slot precisely so the host's level code
+     can decide whether that player was entitled to say it. Anything that
+     moves an entity or decides a win still has to go through the world the
+     host simulates, or clients will disagree with each other.
+
+     Delivery is unreliable and unordered, like everything else on this
+     channel except the acked handshake messages. A level that needs a
+     message to definitely arrive must make it idempotent and repeat it
+     (the roster broadcast above is the pattern to copy), because a single
+     dropped 'lvl' is never retried and nothing will tell you it vanished.
+     ========================================================================= */
+
+  /** Overridden by the level page. (slot, payload) — slot is the sender. */
+  onLevelMsg: function () {},
+
+  /** Fire-and-forget to every connected client. Not sent to the host's own
+   *  level code: a host talking to itself should just call its own
+   *  function directly, the same way reportProgress/selectLevel skip the
+   *  network hop for the host's own player. */
+  broadcastLevelMsg(payload) {
+    const msg = { type: 'lvl', payload };
+    if (!Validate.size(msg)) return false;
+    for (const [peerId, p] of this.peers) {
+      if (peerId === this.selfId) continue;
+      if (p.conn && p.conn.open) { try { p.conn.send(msg); } catch {} }
+    }
+    return true;
+  },
+
   claim(id) {
     for (let s = 0; s < CFG.MAX_PLAYERS; s++) {
       if (!this.used.has(s)) { this.used.add(s); this.slots.set(id, s); return s; }
@@ -1379,6 +1494,23 @@ const Host = {
         this.recomputeLobby();
         return;
       }
+    }
+
+    // Level channel — schemaless pass-through to level code (see
+    // broadcastLevelMsg below and the LEVEL MESSAGE section). Placed
+    // AFTER the p.slot === -1 rejoin gate above deliberately: an
+    // unbound socket that hasn't proven its token yet is not a room
+    // member and must not be able to reach level logic. Placed BEFORE
+    // the input fall-through so a 'lvl' message is never mistaken for
+    // malformed input. Allowed during the lobby phase as well as in
+    // game — a level page is not the only thing that might want it.
+    if (msg && msg.type === 'lvl') {
+      if (!isSafeLevelPayload(msg.payload)) return;
+      const slot = this.slots.get(conn.peer);
+      if (slot === undefined) return;
+      try { this.onLevelMsg(slot, msg.payload); }
+      catch (e) { console.error('[netcode] onLevelMsg threw:', e); }
+      return;
     }
 
     const inp = Validate.input(msg);
@@ -1731,6 +1863,23 @@ const Client = {
   roster: [],
   onRoster: function () {},
 
+  /** Overridden by the level page. (payload) — always from the host. */
+  onLevelMsg: function () {},
+
+  /** Send an arbitrary payload up to the host's onLevelMsg. Returns false
+   *  if there's no open connection or the payload is too large to fit
+   *  MAX_MSG_BYTES — worth checking, since the host silently drops
+   *  anything oversized on arrival and a level would otherwise have no
+   *  way to tell a rejected message from a dropped one. Counts against
+   *  the same per-peer rate limit as input (MAX_MSG_PER_SEC), so this is
+   *  for events, not a per-tick side channel. */
+  sendLevelMsg(payload) {
+    if (!this.alive || !this.conn || !this.conn.open) return false;
+    const msg = { type: 'lvl', payload };
+    if (!Validate.size(msg)) return false;
+    try { this.conn.send(msg); return true; } catch { return false; }
+  },
+
   setRoster(peers) {
     // Host-supplied, so it crosses the trust boundary like anything else
     // off the wire — bound the list and drop anything that isn't a
@@ -1832,6 +1981,17 @@ const Client = {
       this.end(msg.reason === 'bad-token'
         ? 'Could not rejoin the room — your session may have expired.'
         : 'Connection rejected by host.');
+      return;
+    }
+
+    // Level channel — see the LEVEL MESSAGE CHANNEL section on the host
+    // side. Validated even though it came from the host: the host is
+    // more trusted than a peer, but it is still a remote machine, and
+    // this payload goes straight to level code.
+    if (msg.type === 'lvl') {
+      if (!isSafeLevelPayload(msg.payload)) return;
+      try { this.onLevelMsg(msg.payload); }
+      catch (e) { console.error('[netcode] onLevelMsg threw:', e); }
       return;
     }
 
@@ -2156,6 +2316,7 @@ window.Netcode = {
   CFG, BTN, INPUT_MASK,
   Codec, Validate, Host, Client, Tween, JitterTracker, TickClock,
   TYPE_REGISTRY, evaluateWinCondition, evaluateTurnMode, isSafeSyncState,
+  isSafeLevelPayload,
   buildWorld, makePlayer, dropPlayer, stateToMask, maskToState, PALETTE,
 };
 
