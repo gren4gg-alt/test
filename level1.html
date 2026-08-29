@@ -301,9 +301,9 @@ const P = window.Engine.PHYSICS;
    ====================================================================== */
 const DEFAULT_LANES = 2;       // only used when nothing else says otherwise
 const MIN_LANES = 1, MAX_LANES = 8;   // MAX matches netcode's MAX_PLAYERS
-const LANE_LEN   = 1300;       // inside length of a corridor, left to right
+const LANE_LEN   = 2100;       // inside length of a corridor, left to right
 const LANE_H     = 200;        // inside height: player 40 + room for the arc
-const WALL       = 18;         // thickness of every floor/ceiling/end wall
+const WALL       = 13;         // thickness of every floor/ceiling/end wall
 const MARGIN     = 24;         // border around the whole stack
 
 /* ======================================================================
@@ -318,7 +318,7 @@ const BALL_MAX_VX   = 210;     // and the cap, so it can never outrun the player
 const WALL_DAMP     = 0.8;     // energy kept off an end wall
 const START_HEIGHT  = 150;     // how high above the head the ball starts
 
-const GAMEOVER_SECS = 2.0;     // how long the GAME OVER card holds before reset
+const GAMEOVER_SECS = 0.5;     // how long the GAME OVER card holds before reset
 
 const LAND_COLOR = '#8a5fbd';
 const LANE_COLOR = '#a778d6';
