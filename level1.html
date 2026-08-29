@@ -566,10 +566,10 @@ window.Level = {
       // but only the host runs this tick, so the host is what puts the
       // level's own state back — and the restored switch colour reaches
       // clients through the ordinary sync, no message needed.
-      if (world.resetGeneration !== lastGen) {
-        lastGen = world.resetGeneration;
-        resetLevelState();
-      }
+     // if (world.resetGeneration !== lastGen) {
+       // lastGen = world.resetGeneration;
+       // resetLevelState();
+      //}
 
       const players = [];
       for (const p of nw.players.values()) if (p && !p.dead && !p.removed) players.push(p);
