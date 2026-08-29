@@ -292,7 +292,7 @@ const { StaticBody, TriggerZone, BouncingBall, Box, Player, aabbOverlap } = wind
    line inside the level tick to remove it entirely.
    ====================================================================== */
 const GOD = {
-  on: false,             // master switch
+  on: true,             // master switch
   jumpVelocity: 1000,    // engine default is 560 (~92px apex)
   invulnerable: true,    // hazards cannot kill
   showHitboxes: false,
@@ -530,12 +530,46 @@ window.Level = {
 
     /* ---- Level tick ---------------------------------------------------- */
     let boxDelivered = false;
+    let lastGen = world.resetGeneration;
     const engineStep = world.step.bind(world);
+
+    /* ---- What a reset has to undo ---------------------------------------
+       world.add() captures an entity's spawn POSITION and VELOCITY, so
+       resetLevel() restores those on its own. It knows nothing about custom
+       fields, which means the switch's `active` flag and its colour survive
+       a reset and leave the air permanently on — the level is unwinnable-in-
+       reverse after the first attempt. Same for boxDelivered and the cannon
+       cadences, which are plain closure variables the engine cannot see.
+
+       Everything the level itself owns is put back here.
+       ------------------------------------------------------------------ */
+    function resetLevelState() {
+      sw.active = false;
+      sw.color = SWITCH_OFF;
+      boxDelivered = false;
+      for (let i = 0; i < cannons.length; i++) cannons[i].t = cannons[i].cfg.interval;
+
+      // Shots in flight are not spawn-state either — they were created after
+      // build(), so resetLevel() leaves them mid-air.
+      const all = world.entities;
+      for (let i = all.length - 1; i >= 0; i--) {
+        if (all[i] instanceof Shot) world.remove(all[i]);
+      }
+    }
 
     world.step = function (dt) {
       if (IS_HOST && paused) return;      // nothing advances at all
       engineStep(dt);
       if (!IS_HOST || !(dt > 0)) return;
+
+      // A reset bumps resetGeneration. Clients see it through the snapshot,
+      // but only the host runs this tick, so the host is what puts the
+      // level's own state back — and the restored switch colour reaches
+      // clients through the ordinary sync, no message needed.
+      if (world.resetGeneration !== lastGen) {
+        lastGen = world.resetGeneration;
+        resetLevelState();
+      }
 
       const players = [];
       for (const p of nw.players.values()) if (p && !p.dead && !p.removed) players.push(p);
