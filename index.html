@@ -24,6 +24,27 @@ html, body {
   padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
   display: flex; flex-direction: column;
 }
+/* ---- Back Button ---- */
+/* ---- Back Button ---- */
+  .back-btn {
+    display: none; /* Hide by default on page load */
+    position: fixed;
+    top: calc(10px + env(safe-area-inset-top));
+    left: calc(10px + env(safe-area-inset-left));
+    z-index: 40;
+    padding: 6px 14px;
+    border-radius: 20px;
+    border: 1px solid var(--panel-2);
+    background: var(--panel);
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    align-items: center;
+    gap: 4px;
+  }
+  .back-btn:hover { background: var(--panel-2); }
 .primary-btn {
   width: 100%; min-height: var(--tap); border: none; border-radius: var(--radius);
   background: var(--accent); color: #0c1410; font-size: 17px; font-weight: 700; cursor: pointer;
@@ -124,6 +145,7 @@ html, body {
   width:26px; height:26px; border-radius:50%; border:none;
   background:var(--panel-2); color:var(--text); font-size:11px; cursor:pointer; flex-shrink:0;
 }
+.kick-btn { background:rgba(224,108,117,.18); color:var(--danger); }
 /* countdown */
 #countdown { position:fixed; inset:0; z-index:60; display:none;
              flex-direction:column; align-items:center; justify-content:center;
@@ -140,7 +162,7 @@ html, body {
 </style>
 </head>
 <body>
-
+<button id="back-btn" class="back-btn" type="button" aria-label="Back">&#8592; Back</button>
 <!-- Persistent voice/settings overlay. Mounted once, never torn down. -->
 <div id="corner-overlay" class="corner-overlay hidden">
   <div class="voice-compact">
@@ -247,6 +269,23 @@ const $ = id => document.getElementById(id);
 const SESSION_KEY = 'dt-session';
 const COUNTDOWN_SECS = 3;
 
+// Peer construction options, shared by BOTH the host and join paths below
+// so the two can never drift apart.
+//
+// iceServers: PeerJS's default config is STUN-only, and a meaningful share
+// of direct P2P connections fail on strict NATs and mobile carrier
+// networks without a TURN relay to fall back to. Without this, voice (and
+// the game data channel) silently just never connects for some players —
+// which looks like "it works for everyone except that one friend".
+// The list is single-sourced from voicechat.js (loaded above) rather than
+// pasted literally, so changing the TURN provider is a one-file edit.
+const PEER_OPTS = {
+  debug: 1,
+  config: {
+    iceServers: (window.VoiceChat && window.VoiceChat.RECOMMENDED_ICE_SERVERS) || undefined,
+  },
+};
+
 let peer = null;
 let isHost = false;
 let conn = null;          // client only
@@ -269,6 +308,7 @@ function showScreen(which) {
     $(id).classList.toggle('hidden', id !== which);
   }
   $('corner-overlay').classList.toggle('hidden', which === 'screen-join');
+  $('back-btn').style.display = (which === 'screen-lobby') ? 'flex' : 'none';
 }
 
 /* ---------------- level grid ---------------- */
@@ -329,6 +369,26 @@ function selectLevel(i) {
 
 /* ---------------- player list ---------------- */
 
+function peerIdForSlot(slot) {
+  for (const [id, s] of Host.slots) if (s === slot) return id;
+  return null;
+}
+
+function kickPlayer(slot) {
+  if (!isHost) return;
+  const pid = peerIdForSlot(slot);
+  if (!pid || pid === Host.selfId) return; // can't kick the host (yourself)
+  if (!confirm('Remove Player ' + (slot + 1) + ' from the room?')) return;
+
+  const p = Host.peers.get(pid);
+  if (p && p.conn) {
+    // Tell them why before closing, or they just see an unexplained
+    // "Disconnected from host." — same message a network drop would show.
+    try { p.conn.send({ type: 'kicked' }); } catch (e) {}
+    try { p.conn.close(); } catch (e) {}
+  }
+}
+
 function renderPlayers(snap) {
   const list = $('player-list');
   list.innerHTML = '';
@@ -364,6 +424,21 @@ function renderPlayers(snap) {
     check.className = 'player-check';
     check.textContent = p.selection !== null ? '✓' : '';
     li.appendChild(check);
+
+    // Host can remove anyone but themselves. Kicking is just "close their
+    // connection" — netcode.js's own conn 'close' handler (Host.drop())
+    // does the actual cleanup and re-broadcasts lobby state, so there's
+    // nothing else to do here beyond telling them why first.
+    if (isHost && !p.isHost) {
+      const kick = document.createElement('button');
+      kick.type = 'button';
+      kick.className = 'mini-btn kick-btn';
+      kick.textContent = '✕';
+      kick.title = 'Remove from room';
+      kick.setAttribute('aria-label', 'Remove Player ' + (p.slot + 1) + ' from the room');
+      kick.onclick = () => kickPlayer(p.slot);
+      li.appendChild(kick);
+    }
 
     list.appendChild(li);
   }
@@ -532,7 +607,7 @@ function startHosting() {
   // Auto-assigned id: it becomes the room code, and letting PeerJS pick it
   // avoids the "ID is taken" collision a fixed code hits when a previous
   // session's registration hasn't expired yet.
-  peer = new Peer({ debug: 1 });
+  peer = new Peer(PEER_OPTS);
 
   peer.on('open', id => {
     myPeerId = id; roomCode = id;
@@ -584,7 +659,7 @@ $('join-form').onsubmit = ev => {
   $('host-btn').disabled = $('join-btn').disabled = true;
   showJoinError('');
 
-  peer = new Peer({ debug: 1 });
+  peer = new Peer(PEER_OPTS);
   peer.on('open', id => {
     myPeerId = id;
     conn = peer.connect(code, { reliable: false, serialization: 'json' });
@@ -609,6 +684,16 @@ $('join-form').onsubmit = ev => {
       }
       if (msg.type === 'full') { showJoinError('That room is full.'); location.reload(); return; }
       if (msg.type === 'bye') { setStatus('The host ended the session.'); return; }
+
+      if (msg.type === 'kicked') {
+        try { conn.close(); } catch (e) {}
+        try { if (peer && !peer.destroyed) peer.destroy(); } catch (e) {}
+        peer = null; conn = null; isHost = false;
+        showScreen('screen-join');
+        showJoinError('You were removed from this room by the host.');
+        $('host-btn').disabled = $('join-btn').disabled = false;
+        return;
+      }
 
       if (msg.type === 'lobby') {
         // `you` is the host telling us which slot in this snapshot is
@@ -647,6 +732,23 @@ $('copy-code-btn').onclick = () => {
   const done = () => setStatus('Room code copied.');
   if (navigator.clipboard) navigator.clipboard.writeText(roomCode).then(done, () => {});
   else done();
+};
+/* ---------------- back button ---------------- */
+/* ---------------- back button ---------------- */
+$('back-btn').onclick = () => {
+  if (isHost || conn) {
+    // If inside a room/lobby, disconnect and return to Join/Host screen
+    try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+    if (isHost && Host) { try { Host.shutdown(); } catch (e) {} }
+    if (conn) { try { conn.close(); } catch (e) {} }
+    if (peer && !peer.destroyed) { try { peer.destroy(); } catch (e) {} }
+    peer = null; conn = null; isHost = false;
+    showScreen('screen-join');
+    setStatus('');
+    $('host-btn').disabled = $('join-btn').disabled = false;
+  } else if (window.history.length > 1) {
+    window.history.back();
+  }
 };
 
 /* ---------------- entry ----------------
