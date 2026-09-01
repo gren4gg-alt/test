@@ -385,7 +385,7 @@ const PIT_DEATH_PAD = 80;  // deathY = H_ + this
 const ROPES = [
   { x: 300, restLen: 340, fullLen: 340 },   // Rope A — the "just barely" one
   { x: 700, restLen: 380, fullLen: 380 },   // Rope B
-  { x: 1140, restLen: 360, fullLen: 360 },   // Rope C
+  { x: 1130, restLen: 360, fullLen: 360 },   // Rope C
 ];
 
 // Each rope hangs from its own small anchor block instead of a
@@ -396,7 +396,7 @@ const ANCHOR_W     = 40;
 const ANCHOR_H     = 14;
 const ANCHOR_SOLID = true;      // false = decorative only, can't stand on it
 
-const EXIT_GAP     = 190;  // horizontal gap from the last rope to the exit platform
+const EXIT_GAP     = 390;  // horizontal gap from the last rope to the exit platform
 const EXIT_PLAT_W  = 190;
 const EXIT_PLAT_Y  = 430;  // top surface of the exit platform
 
@@ -408,11 +408,10 @@ const CLIMB_SPEED     = 130;   // px/s up the rope while JUMP (W) is held
 const SLIDE_SPEED     = 190;   // px/s down the rope while DOWN (S) is held
 const MIN_DIST        = 34;    // closest you can climb to the pivot
 const EXPAND_SPEED    = 100;   // px/s the rope lengthens after first grab
-const GRAB_RADIUS     = 18;    // px from the rope line that counts as a catch
+const GRAB_RADIUS     = 23;    // px from the rope line that counts as a catch
                                // (ACTION must be held to actually grab)
 const REGRAB_COOLDOWN = 0.30;  // s after letting go before you can catch again
-const RELEASE_BOOST   = 280;    // px from the rope line that counts as a catch
-                               // (ACTION must be held to actually grab)
+const RELEASE_BOOST   = 280;   // s after letting go before you can catch again
 // A remote player's buttons arrive over the network, so a single dropped
 // packet reads as "released" for one tick. Without debouncing, that false
 // release registers as a fresh press the moment the next packet lands —
@@ -425,8 +424,15 @@ const MIN_HANG_TIME   = 0.25;  // s on the rope before E can release you
 const RELEASE_VX_MULT = 0.4;  // multiplier on the swing velocity you keep
 
 // ---- cosmetics ----
-const NODES_PER_ROPE = 7;      // coil dots drawn along each rope
-const NODE_SIZE      = 9;
+// Ropes are no longer made of synced entities. Syncing 7 coils x 3 ropes
+// meant 21 extra dynamic entities in every snapshot at SNAPSHOT_HZ, purely
+// so the client could draw a line — which is what was choking phones.
+// A rope is a straight segment, so the client only needs its angle and
+// length: 3 ropes x 3 numbers, sent at ROPE_SYNC_HZ over the level message
+// channel, and integrated locally in between.
+const ROPE_SYNC_HZ   = 15;     // rope state broadcasts per second
+const ROPE_BLEND     = 0.35;   // how hard a client snaps to host state (0-1)
+const ROPE_SEGMENTS  = 8;      // curve smoothness, purely local — free
 const ROPE_COLOR     = '#c9a36b';
 const PLATFORM_COLOR = '#a778d6';
 const GOAL_COLOR     = '#f0c419';
@@ -595,25 +601,6 @@ function readInput(p) {
            action: !!v.action, down: !!v.down };
 }
 
-/* ---- a single coil dot. Position is driven entirely by RopeSystem;
-        its own physics is disabled so it never drifts. ---- */
-class RopeNode extends BouncingBall {
-  constructor(x, y) {
-    super(x, y, NODE_SIZE, NODE_SIZE, {
-      vx: 0, vy: 0, friction: 0, minSpeed: 0,
-      killsPlayers: false, bounds: null, color: ROPE_COLOR,
-    });
-    this.solid = false;
-    // `kind` is an extraField, so it survives to the client on every
-    // snapshot. Identity does NOT — netcode rebuilds these locally via
-    // makeLocal — so the rope index and node index have to ride in the
-    // tag itself, or the client can't tell which coil belongs to which
-    // rope and draws nothing.
-    this.kind = 'rope';
-  }
-  update() { /* driven by RopeSystem */ }
-}
-
 /* ---- one rope: pivot, angle, riders ---- */
 class Rope {
   constructor(def, index) {
@@ -625,7 +612,6 @@ class Rope {
     this.theta = 0;      // radians from vertical, + = right
     this.omega = 0;
     this.index = index;
-    this.nodes = [];
   }
   tipX() { return this.px + Math.sin(this.theta) * this.len; }
   tipY() { return this.py + Math.cos(this.theta) * this.len; }
@@ -781,15 +767,6 @@ class RopeSystem extends Entity {
       r.omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, r.omega));
       r.theta += r.omega * dt;
 
-      // place the coil dots
-      for (let i = 0; i < r.nodes.length; i++) {
-        const d = r.len * ((i + 1) / r.nodes.length);
-        const pt = r.pointAt(d);
-        const n = r.nodes[i];
-        n.x = pt.x - n.w / 2;
-        n.y = pt.y - n.h / 2;
-        n.vx = 0; n.vy = 0;
-      }
     }
 
   }
@@ -863,6 +840,45 @@ for (const name of ['update', 'step', 'tick', 'fixedUpdate', 'simulate', 'onTick
   }
 }
 
+/* ---- client-side rope playback -------------------------------------
+   Clients get {theta, omega, len} a few times a second and integrate the
+   same pendulum in between, blending toward the host's values as they
+   arrive. That keeps the swing smooth at any snapshot rate without
+   putting a single rope entity on the wire. ---- */
+const clientRopes = ROPES.map(d => ({ theta: 0, omega: 0, len: d.restLen }));
+let clientLastFrame = 0;
+
+(function wireRopeSync() {
+  const N = window.Netcode;
+  if (!N || !N.Client) return;
+  const prev = typeof N.Client.onLevelMsg === 'function'
+    ? N.Client.onLevelMsg.bind(N.Client) : null;
+  N.Client.onLevelMsg = function (payload) {
+    try {
+      if (payload && payload.t === 'rope' && Array.isArray(payload.a)) {
+        for (let i = 0; i < payload.a.length && i < clientRopes.length; i++) {
+          const [th, om, len] = payload.a[i];
+          const c = clientRopes[i];
+          c.theta += (th - c.theta) * ROPE_BLEND;
+          c.omega += (om - c.omega) * ROPE_BLEND;
+          c.len = len;
+        }
+        window.__ropeSync = (window.__ropeSync || 0) + 1;
+      }
+    } catch (e) {}
+    if (prev) return prev(payload);
+  };
+})();
+
+function advanceClientRopes(dt) {
+  const g = (PHYSICS && PHYSICS.GRAVITY) || 1700;
+  for (const c of clientRopes) {
+    if (!(c.len > 0)) continue;
+    c.omega += (-(g / c.len) * Math.sin(c.theta) - ROPE_DAMPING * c.omega) * dt;
+    c.theta += c.omega * dt;
+  }
+}
+
 /* =======================================================================
    Level
    ======================================================================= */
@@ -916,21 +932,12 @@ window.Level = {
     world.add(goal);
     nw.triggers.push(goal);
 
-    // rope coils. BouncingBalls are dynamic — found by the codec via
-    // world.entities.filter(e => e.isBouncingBall), so they are NOT
-    // pushed into any nw array.
+    // No rope entities at all now — the shape is derived from `theta` and
+    // `len`, which the host broadcasts a few times a second.
     for (const r of ropeObjs) {
       r.len = ROPES[r.index].restLen;
       r.grown = ROPES[r.index].fullLen <= ROPES[r.index].restLen;
-      r.theta = 0; r.omega = 0; r.nodes = [];
-      for (let i = 0; i < NODES_PER_ROPE; i++) {
-        const d = r.len * ((i + 1) / NODES_PER_ROPE);
-        const pt = r.pointAt(d);
-        const n = new RopeNode(pt.x - NODE_SIZE / 2, pt.y - NODE_SIZE / 2);
-        n.kind = 'rope:' + r.index + ':' + i;
-        world.add(n);
-        r.nodes.push(n);
-      }
+      r.theta = 0; r.omega = 0;
     }
 
     // controller last — static build order above it is unchanged, so host
@@ -964,71 +971,38 @@ window.Level = {
 /* ---- rope line art, pinned to the interpolated coil positions so it
         looks identical on host and clients. ---- */
 window.LevelDraw = function (ctx, list, t) {
-  // Collect every coil in the draw list. We can't match them by object
-  // identity (the client's are makeLocal copies) and we can't rely on the
-  // `kind` tag either (it doesn't reliably survive to the draw list), so:
-  // parse the tag when it's present, and otherwise work out which rope a
-  // coil belongs to from its position — a coil sits on the straight line
-  // from its own pivot, so the nearest pivot wins, and distance from that
-  // pivot gives the order along the rope.
-  const coils = [];
-  for (let i = 0; i < list.length; i++) {
-    const it = list[i], e = it.entity;
-    if (!e) continue;
-    const k = typeof e.kind === 'string' ? e.kind : '';
-    const isCoil = k.indexOf('rope') === 0 ||
-                   (e.isBouncingBall && e.w <= NODE_SIZE + 2 && e.h <= NODE_SIZE + 2);
-    if (!isCoil) continue;
-    coils.push({
-      x: it.x + (e.w || NODE_SIZE) / 2,
-      y: it.y + (e.h || NODE_SIZE) / 2,
-      tag: k.indexOf('rope:') === 0 ? k.split(':') : null,
-    });
-  }
-  if (ROPE_DEBUG) window.__ropeCoils = coils.length;
+  // Nothing is looked up in the draw list any more. The host draws from
+  // its live rope objects; a client draws from the state it was sent,
+  // advanced locally between messages.
+  const now = performance.now();
+  const dt = clientLastFrame ? Math.min(0.05, (now - clientLastFrame) / 1000) : 0;
+  clientLastFrame = now;
 
-  const byRope = [];
-  for (const c of coils) {
-    let ri, ord;
-    if (c.tag) {
-      ri = +c.tag[1]; ord = +c.tag[2];
-    } else {
-      // nearest pivot, then distance along the rope as the ordering key
-      let best = -1, bestD = Infinity;
-      for (let r = 0; r < ROPES.length; r++) {
-        const d = Math.hypot(c.x - ROPES[r].x, c.y - CEILING_Y);
-        const dx = Math.abs(c.x - ROPES[r].x);
-        const score = d + dx * 0.5;   // bias toward the pivot overhead
-        if (score < bestD) { bestD = score; best = r; }
-      }
-      ri = best;
-      ord = Math.hypot(c.x - ROPES[ri].x, c.y - CEILING_Y);
-    }
-    if (!(ri >= 0)) continue;
-    (byRope[ri] || (byRope[ri] = [])).push({ i: ord, x: c.x, y: c.y });
-  }
+  const H = window.Netcode && window.Netcode.Host;
+  const isHost = !!(H && H.nw);
+  if (!isHost) advanceClientRopes(dt);
 
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   for (let ri = 0; ri < ROPES.length; ri++) {
-    const pts = byRope[ri];
-    if (!pts || !pts.length) continue;
-    pts.sort((a, b) => a.i - b.i);
-    // The pivot comes from the ROPES config, which both sides have, so the
-    // line is anchored correctly even before the first snapshot lands.
-    const path = [{ x: ROPES[ri].x, y: CEILING_Y }].concat(pts);
+    const src = isHost ? ropeObjs[ri] : clientRopes[ri];
+    if (!src || !(src.len > 0)) continue;
+    const px = ROPES[ri].x, py = CEILING_Y;
+    const sin = Math.sin(src.theta), cos = Math.cos(src.theta);
+
+    // A straight segment, drawn as several points so a future sag or
+    // wobble can be added without touching anything else.
+    const path = [];
+    for (let k = 0; k <= ROPE_SEGMENTS; k++) {
+      const d = src.len * (k / ROPE_SEGMENTS);
+      path.push({ x: px + sin * d, y: py + cos * d });
+    }
 
     const trace = () => {
       ctx.beginPath();
       ctx.moveTo(path[0].x, path[0].y);
-      for (let k = 1; k < path.length - 1; k++) {
-        const mx = (path[k].x + path[k + 1].x) / 2;
-        const my = (path[k].y + path[k + 1].y) / 2;
-        ctx.quadraticCurveTo(path[k].x, path[k].y, mx, my);
-      }
-      const last = path[path.length - 1];
-      ctx.lineTo(last.x, last.y);
+      for (let k = 1; k < path.length; k++) ctx.lineTo(path[k].x, path[k].y);
     };
 
     trace(); ctx.strokeStyle = 'rgba(0,0,0,0.40)';        ctx.lineWidth = 7;   ctx.stroke();
@@ -1037,9 +1011,10 @@ window.LevelDraw = function (ctx, list, t) {
 
     ctx.fillStyle = '#8a6a3d';
     ctx.beginPath();
-    ctx.arc(ROPES[ri].x, CEILING_Y, 5, 0, Math.PI * 2);
+    ctx.arc(px, py, 5, 0, Math.PI * 2);
     ctx.fill();
   }
+
   // --- debug readout: which input field was found, and who's holding
   //     ACTION right now. Delete this block once grabbing works. ---
   if (ROPE_DEBUG) {
@@ -1058,8 +1033,8 @@ window.LevelDraw = function (ctx, list, t) {
                  12, CEILING_Y + 106);
     ctx.fillText('local .down: ' + (window.__ropeLocDown || '-'), 12, CEILING_Y + 122);
     ctx.fillText('slide now: ' + (window.__ropeSliding || '-'), 12, CEILING_Y + 138);
-    ctx.fillStyle = window.__ropeCoils ? '#8affa0' : '#ff8a8a';
-    ctx.fillText('coils in draw list: ' + (window.__ropeCoils || 0), 12, CEILING_Y + 154);
+    ctx.fillStyle = '#c8c8d8';
+    ctx.fillText('rope msgs rx: ' + (window.__ropeSync || 0), 12, CEILING_Y + 154);
   }
   ctx.restore();
 };
@@ -1387,9 +1362,6 @@ function draw() {
     // (engine.js sets isCameraWall on them) — drawing them is what put
     // those stray rectangles on screen.
     if (e.isCameraWall) continue;
-    // coils are invisible carriers; the rope is one line from LevelDraw
-    if (typeof e.kind === 'string' && e.kind.indexOf('rope') === 0) continue;
-    if (e.isBouncingBall && e.w <= 11 && e.h <= 11) continue;
     const x = it.x, y = it.y;
 
     if (e instanceof Player) {
