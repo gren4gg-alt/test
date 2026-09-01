@@ -1003,41 +1003,132 @@ window.Level = {
 
 /* ---- rope line art, pinned to the interpolated coil positions so it
         looks identical on host and clients. ---- */
+/* ---- client rope rendering -----------------------------------------
+   The rope and the players riding it are separate synced entities, so the
+   client interpolates them independently — different sample points, and
+   packet jitter on top. That is why a rider appeared to swing in mid-air
+   beside their rope: neither was wrong, they just weren't in step.
+
+   So the rope is no longer drawn from its own interpolated data when
+   someone is on it. The tip still gives the authoritative LENGTH, but the
+   DIRECTION comes from the rider's own interpolated position. The rope is
+   then drawn through the rider by construction and cannot disagree with
+   them at any latency.
+
+   Rope claims are sticky (CLAIM_HOLD) and one player can only be claimed
+   by one rope, which is what stops a player passing near another rope
+   from snapping onto it for a frame. ---- */
+const ATTACH_SNAP = 22;    // px from the rope line that reads as "riding it"
+const CLAIM_HOLD  = 0.35;  // s a rope keeps its rider after they stop matching
+const ANGLE_SMOOTH = 14;   // per-second smoothing on the drawn angle
+
+const drawState = ROPES.map(() => ({ theta: null, claim: null, held: 0 }));
+let drawLast = 0;
+
+function shortestAngleTo(from, to) {
+  let d = to - from;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
 window.LevelDraw = function (ctx, list, t) {
-  // Each rope's tip identifies itself by its width: TIP_SIZE + rope index.
-  // No proximity guessing, so ropes swinging past each other can't swap or
-  // share tips.
+  const now = performance.now();
+  const dt = drawLast ? Math.min(0.05, (now - drawLast) / 1000) : 0;
+  drawLast = now;
+
+  // --- gather tips (identified by width) and players ---
   const tipFor = [];
-  let found = 0;
+  const players = [];
   for (let i = 0; i < list.length; i++) {
     const it = list[i], e = it.entity;
-    if (!e || !e.isBouncingBall) continue;
-    const w = e.w || 0;
-    if (w < TIP_SIZE || w > TIP_INDEX_MAX) continue;
-    const ri = w - TIP_SIZE;
-    if (ri < 0 || ri >= ROPES.length || tipFor[ri]) continue;
-    tipFor[ri] = { x: it.x + w / 2, y: it.y + (e.h || w) / 2 };
-    found++;
+    if (!e) continue;
+    if (e.isBouncingBall) {
+      const w = e.w || 0;
+      if (w >= TIP_SIZE && w <= TIP_INDEX_MAX) {
+        const ri = w - TIP_SIZE;
+        if (ri >= 0 && ri < ROPES.length && !tipFor[ri]) {
+          tipFor[ri] = { x: it.x + w / 2, y: it.y + (e.h || w) / 2 };
+        }
+      }
+      continue;
+    }
+    if (e instanceof Player && !e.dead) {
+      players.push({ e, x: it.x + e.w / 2, y: it.y + e.h / 2 });
+    }
   }
-  if (ROPE_DEBUG) window.__ropeTips = found;
+  if (ROPE_DEBUG) window.__ropeTips = tipFor.filter(Boolean).length;
 
+  // --- claim one rider per rope, nearest first, with hysteresis ---
+  const taken = new Set();
+  for (let ri = 0; ri < ROPES.length; ri++) {
+    const st = drawState[ri], tip = tipFor[ri];
+    if (!tip) { st.claim = null; continue; }
+    const px = ROPES[ri].x, py = CEILING_Y;
+    const len = Math.hypot(tip.x - px, tip.y - py);
+    if (!(len > 1)) { st.claim = null; continue; }
+    const ux = (tip.x - px) / len, uy = (tip.y - py) / len;
+
+    let best = null, bestD = ATTACH_SNAP;
+    for (const p of players) {
+      if (taken.has(p.e)) continue;
+      const rx = p.x - px, ry = p.y - py;
+      const along = rx * ux + ry * uy;
+      if (along < 0 || along > len + 12) continue;      // past either end
+      const perp = Math.abs(rx * uy - ry * ux);          // distance off the line
+      if (perp < bestD) { bestD = perp; best = p; }
+    }
+
+    if (best) {
+      st.claim = best.e; st.held = CLAIM_HOLD;
+      taken.add(best.e);
+    } else if (st.claim) {
+      // keep the old claim briefly so a dropped snapshot doesn't make the
+      // rope visibly let go and re-grab
+      st.held -= dt;
+      if (st.held <= 0) st.claim = null;
+      else {
+        const still = players.find(p => p.e === st.claim);
+        if (still) taken.add(still.e); else st.claim = null;
+      }
+    }
+  }
+
+  // --- draw ---
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   for (let ri = 0; ri < ROPES.length; ri++) {
     const tip = tipFor[ri];
     if (!tip) continue;
+    const st = drawState[ri];
     const px = ROPES[ri].x, py = CEILING_Y;
+    const len = Math.hypot(tip.x - px, tip.y - py);
+    if (!(len > 1)) continue;
 
-    const path = [];
-    for (let k = 0; k <= ROPE_SEGMENTS; k++) {
-      const f = k / ROPE_SEGMENTS;
-      path.push({ x: px + (tip.x - px) * f, y: py + (tip.y - py) * f });
-    }
+    // Direction: from the rider if there is one (so the rope can never
+    // drift away from them), otherwise from the tip.
+    let target;
+    const rider = st.claim ? players.find(p => p.e === st.claim) : null;
+    if (rider) target = Math.atan2(rider.x - px, rider.y - py);
+    else        target = Math.atan2(tip.x - px, tip.y - py);
+
+    // Smooth the drawn angle. Snapshot jitter shows up as small angular
+    // steps; this removes them without adding meaningful lag.
+    if (st.theta === null) st.theta = target;
+    else st.theta += shortestAngleTo(st.theta, target) *
+                     Math.min(1, ANGLE_SMOOTH * dt);
+
+    const ex = px + Math.sin(st.theta) * len;
+    const ey = py + Math.cos(st.theta) * len;
+
     const trace = () => {
       ctx.beginPath();
-      ctx.moveTo(path[0].x, path[0].y);
-      for (let k = 1; k < path.length; k++) ctx.lineTo(path[k].x, path[k].y);
+      ctx.moveTo(px, py);
+      for (let k = 1; k <= ROPE_SEGMENTS; k++) {
+        const f = k / ROPE_SEGMENTS;
+        ctx.lineTo(px + (ex - px) * f, py + (ey - py) * f);
+      }
     };
     trace(); ctx.strokeStyle = 'rgba(0,0,0,0.40)';        ctx.lineWidth = 7;   ctx.stroke();
     trace(); ctx.strokeStyle = ROPE_COLOR;                ctx.lineWidth = 4;   ctx.stroke();
