@@ -411,10 +411,8 @@ const EXPAND_SPEED    = 100;   // px/s the rope lengthens after first grab
 const GRAB_RADIUS     = 18;    // px from the rope line that counts as a catch
                                // (ACTION must be held to actually grab)
 const REGRAB_COOLDOWN = 0.30;  // s after letting go before you can catch again
-const RELEASE_BOOST   = 230;   // upward kick on release — E is a real jump
-                               // off the rope, not just a let-go. Lower it
-                               // toward 0 for a pure swing-momentum launch.
-const RELEASE_VX_MULT = 0.4;  // s after letting go before you can catch again
+const RELEASE_BOOST   = 280;    // px from the rope line that counts as a catch
+                               // (ACTION must be held to actually grab)
 // A remote player's buttons arrive over the network, so a single dropped
 // packet reads as "released" for one tick. Without debouncing, that false
 // release registers as a fresh press the moment the next packet lands —
@@ -424,6 +422,7 @@ const ACTION_DEBOUNCE = 0.12;  // s
 const MIN_HANG_TIME   = 0.25;  // s on the rope before E can release you
                                // off the rope, not just a let-go. Lower it
                                // toward 0 for a pure swing-momentum launch.
+const RELEASE_VX_MULT = 0.4;  // multiplier on the swing velocity you keep
 
 // ---- cosmetics ----
 const NODES_PER_ROPE = 7;      // coil dots drawn along each rope
@@ -605,6 +604,11 @@ class RopeNode extends BouncingBall {
       killsPlayers: false, bounds: null, color: ROPE_COLOR,
     });
     this.solid = false;
+    // `kind` is an extraField, so it survives to the client on every
+    // snapshot. Identity does NOT — netcode rebuilds these locally via
+    // makeLocal — so the rope index and node index have to ride in the
+    // tag itself, or the client can't tell which coil belongs to which
+    // rope and draws nothing.
     this.kind = 'rope';
   }
   update() { /* driven by RopeSystem */ }
@@ -923,6 +927,7 @@ window.Level = {
         const d = r.len * ((i + 1) / NODES_PER_ROPE);
         const pt = r.pointAt(d);
         const n = new RopeNode(pt.x - NODE_SIZE / 2, pt.y - NODE_SIZE / 2);
+        n.kind = 'rope:' + r.index + ':' + i;
         world.add(n);
         r.nodes.push(n);
       }
@@ -959,31 +964,61 @@ window.Level = {
 /* ---- rope line art, pinned to the interpolated coil positions so it
         looks identical on host and clients. ---- */
 window.LevelDraw = function (ctx, list, t) {
-  const byRope = [];
+  // Collect every coil in the draw list. We can't match them by object
+  // identity (the client's are makeLocal copies) and we can't rely on the
+  // `kind` tag either (it doesn't reliably survive to the draw list), so:
+  // parse the tag when it's present, and otherwise work out which rope a
+  // coil belongs to from its position — a coil sits on the straight line
+  // from its own pivot, so the nearest pivot wins, and distance from that
+  // pivot gives the order along the rope.
+  const coils = [];
   for (let i = 0; i < list.length; i++) {
-    const e = list[i].entity;
-    if (!e || e.kind !== 'rope') continue;
-    for (let ri = 0; ri < ropeObjs.length; ri++) {
-      const idx = ropeObjs[ri].nodes.indexOf(e);
-      if (idx === -1) continue;
-      (byRope[ri] || (byRope[ri] = [])).push({
-        i: idx, x: list[i].x + e.w / 2, y: list[i].y + e.h / 2,
-      });
+    const it = list[i], e = it.entity;
+    if (!e) continue;
+    const k = typeof e.kind === 'string' ? e.kind : '';
+    const isCoil = k.indexOf('rope') === 0 ||
+                   (e.isBouncingBall && e.w <= NODE_SIZE + 2 && e.h <= NODE_SIZE + 2);
+    if (!isCoil) continue;
+    coils.push({
+      x: it.x + (e.w || NODE_SIZE) / 2,
+      y: it.y + (e.h || NODE_SIZE) / 2,
+      tag: k.indexOf('rope:') === 0 ? k.split(':') : null,
+    });
+  }
+  if (ROPE_DEBUG) window.__ropeCoils = coils.length;
+
+  const byRope = [];
+  for (const c of coils) {
+    let ri, ord;
+    if (c.tag) {
+      ri = +c.tag[1]; ord = +c.tag[2];
+    } else {
+      // nearest pivot, then distance along the rope as the ordering key
+      let best = -1, bestD = Infinity;
+      for (let r = 0; r < ROPES.length; r++) {
+        const d = Math.hypot(c.x - ROPES[r].x, c.y - CEILING_Y);
+        const dx = Math.abs(c.x - ROPES[r].x);
+        const score = d + dx * 0.5;   // bias toward the pivot overhead
+        if (score < bestD) { bestD = score; best = r; }
+      }
+      ri = best;
+      ord = Math.hypot(c.x - ROPES[ri].x, c.y - CEILING_Y);
     }
+    if (!(ri >= 0)) continue;
+    (byRope[ri] || (byRope[ri] = [])).push({ i: ord, x: c.x, y: c.y });
   }
 
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  for (let ri = 0; ri < ropeObjs.length; ri++) {
+  for (let ri = 0; ri < ROPES.length; ri++) {
     const pts = byRope[ri];
     if (!pts || !pts.length) continue;
     pts.sort((a, b) => a.i - b.i);
-    const path = [{ x: ropeObjs[ri].px, y: ropeObjs[ri].py }].concat(pts);
+    // The pivot comes from the ROPES config, which both sides have, so the
+    // line is anchored correctly even before the first snapshot lands.
+    const path = [{ x: ROPES[ri].x, y: CEILING_Y }].concat(pts);
 
-    // One smooth stroke through the carrier points (midpoint quadratics)
-    // instead of a dot per node, so the rope reads as a single uniform
-    // cord with no beads or knots along it.
     const trace = () => {
       ctx.beginPath();
       ctx.moveTo(path[0].x, path[0].y);
@@ -1002,7 +1037,7 @@ window.LevelDraw = function (ctx, list, t) {
 
     ctx.fillStyle = '#8a6a3d';
     ctx.beginPath();
-    ctx.arc(ropeObjs[ri].px, ropeObjs[ri].py, 5, 0, Math.PI * 2);
+    ctx.arc(ROPES[ri].x, CEILING_Y, 5, 0, Math.PI * 2);
     ctx.fill();
   }
   // --- debug readout: which input field was found, and who's holding
@@ -1023,6 +1058,8 @@ window.LevelDraw = function (ctx, list, t) {
                  12, CEILING_Y + 106);
     ctx.fillText('local .down: ' + (window.__ropeLocDown || '-'), 12, CEILING_Y + 122);
     ctx.fillText('slide now: ' + (window.__ropeSliding || '-'), 12, CEILING_Y + 138);
+    ctx.fillStyle = window.__ropeCoils ? '#8affa0' : '#ff8a8a';
+    ctx.fillText('coils in draw list: ' + (window.__ropeCoils || 0), 12, CEILING_Y + 154);
   }
   ctx.restore();
 };
@@ -1330,15 +1367,17 @@ function draw() {
 
   const list = side.renderList();
 
+  // Level-owned art, drawn inside the world transform and behind entities.
+  if (typeof window.LevelDraw === 'function') {
+    try { window.LevelDraw(ctx, list, t); }
+    catch (err) { console.warn('LevelDraw threw:', err); }
+  }
+
   for (let i = 0; i < list.length; i++) {
     const e = list[i].entity;
     if (!e.isWindZone) continue;
     ctx.fillStyle = e.color;
     ctx.fillRect(list[i].x, list[i].y, e.w, e.h);
-  }
-
-  if (typeof window.LevelDraw === 'function') {
-    try { window.LevelDraw(ctx, list, t); } catch (err) {}
   }
 
   for (let i = 0; i < list.length; i++) {
@@ -1348,7 +1387,9 @@ function draw() {
     // (engine.js sets isCameraWall on them) — drawing them is what put
     // those stray rectangles on screen.
     if (e.isCameraWall) continue;
-    if (e.kind === 'rope') continue;
+    // coils are invisible carriers; the rope is one line from LevelDraw
+    if (typeof e.kind === 'string' && e.kind.indexOf('rope') === 0) continue;
+    if (e.isBouncingBall && e.w <= 11 && e.h <= 11) continue;
     const x = it.x, y = it.y;
 
     if (e instanceof Player) {
