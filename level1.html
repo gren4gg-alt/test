@@ -379,19 +379,24 @@ const PIT_DEATH_PAD = 80;  // deathY = H_ + this
 
 // ---- ropes ----
 // One entry per rope, left to right. Add or remove entries freely.
-// x           : where the rope hangs from (its pivot)
-// restLen     : length with nobody on it
-// growPerRider: extra length for each player currently hanging on it, so
-//               the rope pays itself out as the team climbs on and pulls
-//               back up as they leave
-// maxLen      : hard ceiling on restLen + growth
+// restLen      : length with nobody on it, for a 2-player team
+// shrinkPerHead: how much SHORTER it starts for each player beyond the
+//                second — a bigger team has to build a taller stack
+// growPerRider : extra length per player currently hanging on it
+// maxLen       : hard ceiling
+// minLen       : floor, so a big team can't shrink it out of reach entirely
+//
+// Once every player is on the rope at the same time the length LATCHES:
+// from then on it only ever grows, never retracts, so the last player up
+// can't be stranded by someone else letting go.
 const ROPES = [
   // Rope A — the "just barely" one. Short enough that a lone player can't
   // reach it: two must stack, the top one catches the tail, and the rope
   // then pays out far enough for the next player to reach from the ledge.
   // Every extra rider lowers it again, so a 4-player team ends up with a
   // much longer rope than a 2-player one.
-  { x: 300,  restLen: 340, growPerRider: 60, maxLen: 520 },
+  { x: 300,  restLen: 340, shrinkPerHead: 45, growPerRider: 60,
+             maxLen: 520, minLen: 200 },
   { x: 700,  restLen: 380 },
   { x: 1130, restLen: 360 },
 ];
@@ -615,8 +620,11 @@ class Rope {
     this.px = def.x;
     this.py = CEILING_Y;
     this.restLen = def.restLen;
+    this.shrinkPerHead = def.shrinkPerHead || 0;
     this.growPerRider = def.growPerRider || 0;
     this.maxLen = def.maxLen || def.restLen;
+    this.minLen = def.minLen || 120;
+    this.latched = false;   // true once everyone has been on at once
     this.len = def.restLen;
     this.theta = 0;      // radians from vertical, + = right
     this.omega = 0;
@@ -688,7 +696,7 @@ class RopeSystem extends Entity {
       this.cooldown.clear();
       this.act.clear();
       this.hangTime.clear();
-      for (const r of this.ropes) { r.theta = 0; r.omega = 0; }
+      for (const r of this.ropes) { r.theta = 0; r.omega = 0; r.latched = false; }
     }
 
     refreshInputs();
@@ -750,7 +758,17 @@ class RopeSystem extends Entity {
       // retracts) so nobody's grip position jumps.
       let onThisRope = 0;
       for (const v of this.riders.values()) if (v.rope === r) onThisRope++;
-      const target = Math.min(r.maxLen, r.restLen + r.growPerRider * onThisRope);
+
+      // Starting length shrinks with team size: two players need a short
+      // stack, four need a tall one. Then it pays out per rider.
+      const heads = Math.max(2, players.length);
+      const start = Math.max(r.minLen,
+                             r.restLen - r.shrinkPerHead * (heads - 2));
+      let target = Math.min(r.maxLen, start + r.growPerRider * onThisRope);
+
+      // Everyone on at once? Latch, and never let it retract again.
+      if (onThisRope >= players.length && players.length > 0) r.latched = true;
+      if (r.latched) target = Math.max(target, r.len);
       if (Math.abs(target - r.len) > 0.5) {
         const before = r.len;
         const dir = target > r.len ? 1 : -1;
@@ -890,6 +908,21 @@ let clientLastFrame = 0;
   }
   install();
   setInterval(install, 1000);
+
+  // If nothing has arrived after a few seconds, say so loudly and dump
+  // what the Client object actually offers — the handler name is the only
+  // thing that can be wrong at that point.
+  setTimeout(function () {
+    const N = window.Netcode;
+    const isClient = !(N && N.Host && N.Host.nw);
+    if (isClient && !window.__ropeSync) {
+      try {
+        console.warn('[rope] no rope messages received. Client keys:',
+          Object.keys(N.Client).join(','),
+          '| proto:', Object.getOwnPropertyNames(Object.getPrototypeOf(N.Client) || {}).join(','));
+      } catch (e) {}
+    }
+  }, 5000);
 })();
 
 function advanceClientRopes(dt) {
@@ -958,6 +991,7 @@ window.Level = {
     // `len`, which the host broadcasts a few times a second.
     for (const r of ropeObjs) {
       r.len = ROPES[r.index].restLen;
+      r.latched = false;
       r.theta = 0; r.omega = 0;
     }
 
@@ -1055,7 +1089,12 @@ window.LevelDraw = function (ctx, list, t) {
     ctx.fillText('local .down: ' + (window.__ropeLocDown || '-'), 12, CEILING_Y + 122);
     ctx.fillText('slide now: ' + (window.__ropeSliding || '-'), 12, CEILING_Y + 138);
     ctx.fillStyle = '#c8c8d8';
-    ctx.fillText('rope msgs rx: ' + (window.__ropeSync || 0), 12, CEILING_Y + 154);
+    ctx.fillText('rope tx: ' + (window.__ropeTx || 0) +
+                 '   rx: ' + (window.__ropeSync || 0), 12, CEILING_Y + 154);
+    if (window.__ropeTxErr) {
+      ctx.fillStyle = '#ff8a8a';
+      ctx.fillText('tx error: ' + window.__ropeTxErr, 12, CEILING_Y + 170);
+    }
   }
   ctx.restore();
 };
