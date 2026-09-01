@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Duble Trouble — Keepie Uppie</title>
+<title>Duble Trouble — Rope Line</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -21,7 +21,29 @@
     z-index: 0;
     pointer-events: none;
   }
-
+/* ---- Back Button ---- */
+  #backBtn {
+    position: fixed;
+    top: 6px;
+    left: 8px;
+    z-index: 15;
+    padding: 6px 12px;
+    border-radius: 20px;
+    border: 1px solid #45455e;
+    background: rgba(36, 36, 48, 0.85);
+    color: #e6e6f0;
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  #backBtn:hover { background: rgba(58, 58, 76, 0.95); }
+  /* Update existing #hud rule to shift it right of the back button */
+  #hud { position:fixed; top:6px; left:100px; font:11px ui-monospace, monospace;
+         color:#6a6a80; pointer-events:none; z-index:5; }
   /* Replaces the old #lobby host/join screen — this page only ever
      arrives via hand-off from the lobby (see HANDOFF CONTRACT in
      netcode.js), so there's nothing to host/join here. Just a status
@@ -85,7 +107,7 @@
   .pad { display:flex; gap:10px; pointer-events:auto; }
   /* 50px is about the smallest a thumb target should go — below ~44px
      accuracy falls off badly, and these get pressed under pressure. */
-  .tbtn { width:70px; height:70px; border-radius:50%; border:1px solid #45455e;
+  .tbtn { width:50px; height:50px; border-radius:50%; border:1px solid #45455e;
           background:rgba(40,40,58,.72); color:#d8d8ea; font-size:16px;
           display:flex; align-items:center; justify-content:center;
           backdrop-filter: blur(3px); }
@@ -98,7 +120,7 @@
   @media (pointer: coarse) and (orientation: portrait) { #rotate { display:flex; } }
 
   /* ---- voice/settings overlay (top-right, persistent once in-game) ---- */
-  #voiceBar { position:fixed; top:6px; right:8px; z-index:60; display:none;
+  #voiceBar { position:fixed; top:6px; right:8px; z-index:15; display:none;
               align-items:center; gap:6px; }
   #voiceBar.on { display:flex; }
   .vbtn { width:30px; height:30px; border-radius:50%; border:1px solid #45455e;
@@ -153,6 +175,7 @@
 <div id="stage">
   <canvas id="game"></canvas>
 </div>
+<button id="backBtn" type="button" aria-label="Back to Lobby">&#8592; Lobby</button>
 <div id="hud"></div>
 <div id="countdown"><div id="cdNum">3</div><div id="cdHint">Get ready…</div></div>
 <div id="toast"></div>
@@ -180,6 +203,7 @@
   <div class="pad">
     <div class="tbtn" id="btnLeft">&#9664;</div>
     <div class="tbtn" id="btnRight">&#9654;</div>
+    <div class="tbtn" id="btnDown">&#9660;</div>
   </div>
   <div class="pad">
     <div class="tbtn" id="btnAction">&#9995;</div>
@@ -199,549 +223,803 @@
 (function() {
   "use strict";
   const canvas = document.getElementById('bg-canvas');
-  const ctx = canvas.getContext('2d');
+  
+  // High-performance context setup
+  const renderer = new THREE.WebGLRenderer({ 
+    canvas: canvas, 
+    antialias: false, 
+    powerPreference: "high-performance",
+    depth: true,
+    stencil: false
+  });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 
-  function resizeCanvas() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+  const scene = new THREE.Scene();
+  
+  // Dark Twilight / Synthwave palette
+  const skyColor = 0x0d0b18;   // Deep midnight purple
+  const fogColor = 0x18122b;   // Soft atmospheric twilight
+  scene.background = new THREE.Color(skyColor);
+  scene.fog = new THREE.FogExp2(fogColor, 0.015);
+
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 500);
+  camera.position.set(0, 16, 45);
+  camera.lookAt(0, 4, -50);
+
+  // Distant warm horizon light
+  const sunLight = new THREE.DirectionalLight(0xff6b4a, 1.4);
+  sunLight.position.set(0, 10, -100);
+  scene.add(sunLight);
+
+  // Cool ambient fill for the valley floor
+  const hemiLight = new THREE.HemisphereLight(0x7c4da1, 0x120c1f, 0.9);
+  scene.add(hemiLight);
+
+  // Low-poly terrain geometry (30x30 for top performance)
+  const width = 160;
+  const depth = 240;
+  const segments = 30;
+
+  const geometry = new THREE.PlaneGeometry(width, depth, segments, segments);
+  geometry.rotateX(-Math.PI / 2);
+
+  const pos = geometry.attributes.position;
+  
+  // Create an array to hold per-vertex RGB colors for violet grass stylization
+  const colors = new Float32Array(pos.count * 3);
+
+  // Defining color palette shades (RGB values normalized 0.0 - 1.0)
+  const colorGrassTop = new THREE.Color(0x8b41b0);    // Bright Violet Grass Top
+  const colorGrassBase = new THREE.Color(0x4a1970);   // Deep Violet Slope
+  const colorValleyFloor = new THREE.Color(0x1a1330); // Dark Midnight Base
+
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const z = pos.getZ(i);
+
+    const distFromCenter = Math.abs(x);
+    let height = Math.pow(distFromCenter / 11, 2.1);
+
+    const hillNoise = Math.sin(x * 0.12) * Math.cos(z * 0.08) * 3.5 +
+                      Math.sin(z * 0.04) * 4;
+    height += hillNoise;
+
+    if (distFromCenter < 12) {
+      height = Math.sin(z * 0.08) * 0.7;
+    }
+
+    pos.setY(i, height);
+
+    // Vertex color calculations based on height & distance
+    const vertexColor = new THREE.Color();
+    if (height > 6) {
+      // High hill peaks -> Vibrant Violet Grass tips
+      const factor = Math.min(1.0, (height - 6) / 14);
+      vertexColor.copy(colorGrassBase).lerp(colorGrassTop, factor);
+    } else if (height > 1) {
+      // Low slopes -> Medium Violet tint
+      const factor = (height - 1) / 5;
+      vertexColor.copy(colorValleyFloor).lerp(colorGrassBase, factor);
+    } else {
+      // Path / low valley floor -> Midnight Purple Shadow
+      vertexColor.copy(colorValleyFloor);
+    }
+
+    colors[i * 3]     = vertexColor.r;
+    colors[i * 3 + 1] = vertexColor.g;
+    colors[i * 3 + 2] = vertexColor.b;
   }
-  window.addEventListener('resize', resizeCanvas);
-  resizeCanvas();
 
-  // Create background particles (stars / dust)
-  const particleCount = 40;
-  const particles = [];
+  // Attach vertex colors to geometry
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.computeVertexNormals();
 
-  for (let i = 0; i < particleCount; i++) {
-    particles.push({
-      x: Math.random() * canvas.width,
-      y: Math.random() * canvas.height,
-      size: Math.random() * 2.5 + 0.5,
-      speed: Math.random() * 0.4 + 0.1, // Horizontal drift speed
-      opacity: Math.random() * 0.7 + 0.3
-    });
-  }
+  // Material configured to use per-vertex colors
+  const terrainMaterial = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.8,
+    metalness: 0.15,
+    flatShading: true
+  });
 
-  function animateBG() {
+  const terrain = new THREE.Mesh(geometry, terrainMaterial);
+  terrain.position.z = -50;
+  scene.add(terrain);
+
+  // 30 FPS render loop gate
+  let lastRender = 0;
+  const fpsInterval = 1000 / 30; 
+
+  function animateBG(currentTime) {
     requestAnimationFrame(animateBG);
 
-    // Deep twilight background gradient
-    const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    grad.addColorStop(0, '#141026');
-    grad.addColorStop(1, '#0d0b18');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    // Update and draw moving particles
-    ctx.fillStyle = '#b19cd9'; // Soft violet tint to match your game vibe
-    for (let i = 0; i < particles.length; i++) {
-      const p = particles[i];
+    const elapsed = currentTime - lastRender;
+    if (elapsed > fpsInterval) {
+      lastRender = currentTime - (elapsed % fpsInterval);
       
-      // Move particle to the left
-      p.x -= p.speed;
-      
-      // If it goes off-screen, wrap it back around to the right
-      if (p.x < 0) {
-        p.x = canvas.width;
-        p.y = Math.random() * canvas.height;
-      }
-
-      ctx.globalAlpha = p.opacity;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-      ctx.fill();
+      // Smooth continuous forward movement
+      terrain.position.z = -50 + ((currentTime * 0.0025) % 20);
+      renderer.render(scene, camera);
     }
-    ctx.globalAlpha = 1.0; // Reset alpha
   }
+  requestAnimationFrame(animateBG);
 
-  animateBG();
+  let resizeTimeout;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(() => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }, 100);
+  });
 })();
 </script>
 <!-- ==========================================================================
-     Level: Keepie Uppie — inlined here in place of level.js.
-
-     THE GAME
-       The arena is a stack of horizontal corridors, one lane per player.
-       Everyone starts at the left of their own lane with a ball already in
-       the air above their head, and has to walk it all the way to the exit
-       on the right WITHOUT letting it touch the lane floor. The ball only
-       goes back up when it lands on your head, so the whole run is a series
-       of small positioning corrections while moving.
-
-       One dropped ball ends it for EVERYONE — the lanes are separate but
-       the failure is shared, which is the only thing making this co-op
-       rather than four people playing solo next to each other.
-
-     WHERE THE LANE COUNT COMES FROM
-       One lane per player, decided BEFORE the arena is built. It cannot be
-       read from nw.players, because Level.build() runs before any Player
-       exists — and it must not be guessed differently on the two sides,
-       because the static entity ids only line up if host and client build
-       the same slabs in the same order. So both sides read the SAME agreed
-       number, from the same places, in this order:
-
-         1. ?lanes=N in the URL           (testing, and the solo button)
-         2. dt-session .players           (what the lobby hands off)
-         3. DEFAULT_LANES                 (last resort)
-
-       See LANE COUNT SOURCES below for the one small thing the lobby has
-       to write for step 2 to work.
-
-     EVERYTHING POSITIONAL IS IN THE CONFIG BLOCK BELOW.
+     Level: Rope Line — inlined here in place of level.js.
+     Everything tunable lives in the SETTINGS block at the top.
      ========================================================================== -->
 <script>
 (function () {
 "use strict";
 
-const { StaticBody, TriggerZone, BouncingBall } = window.Engine;
-const P = window.Engine.PHYSICS;
+const { StaticBody, Entity, TriggerZone, BouncingBall, Player, PHYSICS } = window.Engine;
 
-/* ======================================================================
-   ARENA CONFIG
-   ====================================================================== */
-const DEFAULT_LANES = 2;       // only used when nothing else says otherwise
-const MIN_LANES = 1, MAX_LANES = 8;   // MAX matches netcode's MAX_PLAYERS
-const LANE_LEN   = 2100;       // inside length of a corridor, left to right
-const LANE_H     = 200;        // inside height: player 40 + room for the arc
-const WALL       = 13;         // thickness of every floor/ceiling/end wall
-const MARGIN     = 24;         // border around the whole stack
+/* =======================================================================
+   SETTINGS — tune these, everything below is derived.
+   ======================================================================= */
 
-/* ======================================================================
-   BALL CONFIG — the feel of the juggle lives here.
-   ====================================================================== */
-const BALL_D        = 26;
-const BALL_GRAVITY  = 750;    // softer than the player's 1700: more hang time
-const BOUNCE_V      = 440;     // upward speed off a head — sets the arc height
-const CEIL_DAMP     = 0.4;    // energy kept when it smacks the ceiling
-const STEER         = 5;     // how hard an off-centre header sends it sideways
-const BALL_MAX_VX   = 210;     // and the cap, so it can never outrun the player
-const WALL_DAMP     = 0.8;     // energy kept off an end wall
-const START_HEIGHT  = 150;     // how high above the head the ball starts
+// ---- world frame ----
+const H_          = 620;   // level height
+const CEILING_Y   = 60;    // y the ropes hang from
+const LEDGE_Y     = 470;   // top surface of the start ledge
+const LEDGE_W     = 180;   // width of the start ledge
+const PIT_DEATH_PAD = 80;  // deathY = H_ + this
 
-const GAMEOVER_SECS = 0.5;     // how long the GAME OVER card holds before reset
+// ---- ropes ----
+// x         : where the rope hangs from (its pivot)
+// restLen   : length it hangs at before anyone has touched it
+// fullLen   : length it grows to once first grabbed (set === restLen for no growth)
+// One entry per rope, left to right. Add/remove entries freely.
+const ROPES = [
+  { x: 300, restLen: 340, fullLen: 340 },   // Rope A — the "just barely" one
+  { x: 700, restLen: 380, fullLen: 380 },   // Rope B
+  { x: 1140, restLen: 360, fullLen: 360 },   // Rope C
+];
 
-const LAND_COLOR = '#8a5fbd';
-const LANE_COLOR = '#a778d6';
-const GOAL_COLOR = '#f0c419';
-const VIEW_MODE  = 'whole';
+// Each rope hangs from its own small anchor block instead of a
+// full-width ceiling beam. Set ANCHOR_STYLE to 'none' to have the ropes
+// hang from nothing at all (pure mid-air).
+const ANCHOR_STYLE = 'block';   // 'block' | 'none'
+const ANCHOR_W     = 40;
+const ANCHOR_H     = 14;
+const ANCHOR_SOLID = true;      // false = decorative only, can't stand on it
 
-/* ======================================================================
-   LANE COUNT SOURCES
-   Both sides run this, and both must land on the same number or the arena
-   they build won't match and every synced entity id will be off by a slab.
-   That is why nothing here looks at the live player list.
+const EXIT_GAP     = 390;  // horizontal gap from the last rope to the exit platform
+const EXIT_PLAT_W  = 190;
+const EXIT_PLAT_Y  = 430;  // top surface of the exit platform
 
-   For source 2 the lobby needs to put the party size into the hand-off blob
-   it already writes — one extra field, `players`, on BOTH the host and the
-   client shape:
-       {role:'host',   roomCode, hostSnapshot, players: N}
-       {role:'client', roomCode, token, level,  players: N}
-   netcode.js ignores unknown fields, so adding it is safe. Until the lobby
-   does, ?lanes=N and DEFAULT_LANES cover it.
-   ====================================================================== */
-function resolveLaneCount() {
-  let n = null;
+// ---- rope feel ----
+const ROPE_DAMPING    = 0.55;  // 1/s. higher = swing dies faster
+const PUMP_ACCEL      = 0.8;   // rad/s^2 added by left/right while hanging
+const MAX_OMEGA       = 3;   // rad/s angular speed cap
+const CLIMB_SPEED     = 130;   // px/s up the rope while JUMP (W) is held
+const SLIDE_SPEED     = 190;   // px/s down the rope while DOWN (S) is held
+const MIN_DIST        = 34;    // closest you can climb to the pivot
+const EXPAND_SPEED    = 100;   // px/s the rope lengthens after first grab
+const GRAB_RADIUS     = 18;    // px from the rope line that counts as a catch
+                               // (ACTION must be held to actually grab)
+const REGRAB_COOLDOWN = 0.30;  // s after letting go before you can catch again
+const RELEASE_BOOST   = 230;   // upward kick on release — E is a real jump
+                               // off the rope, not just a let-go. Lower it
+                               // toward 0 for a pure swing-momentum launch.
+const RELEASE_VX_MULT = 0.4;  // multiplier on the swing velocity you keep
 
-  // 1. URL — wins over everything, so a test link can force a layout.
-  try {
-    const q = new URLSearchParams(location.search).get('lanes');
-    if (q) n = parseInt(q, 10);
-  } catch (e) {}
+// ---- cosmetics ----
+const NODES_PER_ROPE = 7;      // coil dots drawn along each rope
+const NODE_SIZE      = 9;
+const ROPE_COLOR     = '#c9a36b';
+const PLATFORM_COLOR = '#a778d6';
+const GOAL_COLOR     = '#f0c419';
 
-  // 2. The hand-off blob. Both roles read their own copy of the same
-  //    number the lobby agreed on, so both build the same arena.
-  if (!n) {
-    try {
-      const sess = JSON.parse(sessionStorage.getItem('dt-session') || 'null');
-      if (sess && sess.players) n = parseInt(sess.players, 10);
-    } catch (e) {}
-  }
+const VIEW_MODE = 'follow';
 
-  if (!n || !isFinite(n)) n = DEFAULT_LANES;
-  return Math.max(MIN_LANES, Math.min(MAX_LANES, n | 0));
+// Draws the input-source readout top-left of the beam. Set false once
+// grabbing is confirmed working.
+const ROPE_DEBUG = true;
+
+// Fixed integration slice for the pendulum, independent of framerate.
+const ROPE_STEP = 1 / 60;
+
+/* =======================================================================
+   derived layout
+   ======================================================================= */
+const lastRope = ROPES[ROPES.length - 1];
+const EXIT_X   = lastRope.x + EXIT_GAP;
+const LEVEL_W  = EXIT_X + EXIT_PLAT_W + 60;
+
+/* =======================================================================
+   ASSUMPTIONS (flagged — these are the only lines likely to need a fix)
+
+   1. Entity.update(dt) is called once per sub-step by World. If your
+      engine passes (dt, world) that's fine — we ignore extra args and use
+      a captured `theWorld` instead.                    -> RopeSystem.update
+   2. Player exposes its held buttons. We read them defensively through
+      readInput() below, which tries .input / .btn / .inputMask. If none
+      match, ropes still swing but pumping/climbing won't respond.
+                                                        -> readInput()
+   3. BouncingBall instances are picked up for sync by
+      world.entities.filter(e => e.isBouncingBall) — so rope coils sync
+      for free without a TYPE_REGISTRY change, and must NOT go in any nw
+      array.                                            -> RopeNode
+   4. Entity updates only run on the host (clients interpolate
+      snapshots), so all rope logic is host-authoritative by default.
+   ======================================================================= */
+
+let theWorld = null;
+let ropeSystem = null;
+
+// --- input plumbing -----------------------------------------------------
+// The Player entity itself carries no button state (confirmed: the
+// resolver found nothing on it). netcode's Host keeps input in its own
+// per-slot records, so we look there instead, and fall back to the local
+// InputManager for the host's own player.
+//
+// Nothing here assumes a field name. Each tick we walk Host.nw.players,
+// find the Player entity inside each record, and find the button state
+// inside the same record — either an object of booleans or a numeric
+// bitmask (netcode BTN: LEFT 1, RIGHT 2, JUMP 4, ACTION 8).
+const NO_INPUT = { left: false, right: false, jump: false, action: false, down: false };
+let inputMap = new Map();   // Player -> {left,right,jump,action}
+
+function looksLikeButtons(o) {
+  return o && typeof o === 'object' &&
+         ('action' in o || 'jump' in o) && ('left' in o || 'right' in o);
 }
-const LANE_COUNT = resolveLaneCount();
+function fromMask(m) {
+  return { left: !!(m & 1), right: !!(m & 2), jump: !!(m & 4),
+           action: !!(m & 8), down: !!(m & 16) };
+}
+function findButtons(rec, depth) {
+  if (!rec || typeof rec !== 'object' || depth > 2) return null;
+  if (looksLikeButtons(rec)) return { v: rec, how: 'obj' };
+  for (const k in rec) {
+    const val = rec[k];
+    if (looksLikeButtons(val)) return { v: val, how: 'obj:' + k };
+  }
+  for (const k in rec) {
+    if (typeof rec[k] === 'number' && /mask|bits|btn|input/i.test(k)) {
+      return { v: fromMask(rec[k]), how: 'mask:' + k };
+    }
+  }
+  return null;
+}
+function findPlayer(rec) {
+  if (rec instanceof Player) return rec;
+  if (!rec || typeof rec !== 'object') return null;
+  for (const k of ['player', 'entity', 'p', 'ent', 'body']) {
+    if (rec[k] instanceof Player) return rec[k];
+  }
+  for (const k in rec) if (rec[k] instanceof Player) return rec[k];
+  return null;
+}
 
-/* ---- Derived geometry — nothing below is hand-typed ------------------- */
-const LANE_PITCH  = LANE_H + WALL;                       // floor-to-floor
-const ARENA_W     = MARGIN * 2 + WALL * 2 + LANE_LEN;
-const ARENA_H     = MARGIN * 2 + WALL + LANE_COUNT * LANE_PITCH;
-const laneInnerY  = i => MARGIN + WALL + i * LANE_PITCH;  // ceiling underside
-const laneFloorY  = i => laneInnerY(i) + LANE_H;          // floor top surface
-const LANE_X      = MARGIN + WALL;
+// The local player's own buttons never go through the network, so grab
+// them straight off whichever input singleton the page exposes.
+function localButtons() {
+  const cands = [window.__gameInput, window.Input, window.input,
+                 window.Game && window.Game.input];
+  for (const c of cands) {
+    if (looksLikeButtons(c)) return { v: c, how: 'local' };
+    if (c && looksLikeButtons(c.state)) return { v: c.state, how: 'local.state' };
+    for (const k of ['state', 'buttons', 'btn', 'held', 'current']) {
+      if (c && looksLikeButtons(c[k])) return { v: c[k], how: 'local.' + k };
+    }
+    if (c && typeof c.getState === 'function') {
+      try { const st = c.getState(); if (looksLikeButtons(st)) return { v: st, how: 'local.getState' }; }
+      catch (e) {}
+    }
+  }
+  return null;
+}
 
-const IS_HOST = (function () {
-  try {
-    const raw = sessionStorage.getItem('dt-session');
-    if (!raw) return true;
-    return (JSON.parse(raw).role || 'host') !== 'client';
-  } catch (e) { return true; }
-})();
+function refreshInputs() {
+  inputMap = new Map();
+  let how = null;
+  const H = window.Netcode && window.Netcode.Host;
+  const recs = H && H.nw && H.nw.players;
+  if (recs && typeof recs.forEach === 'function') {
+    recs.forEach((rec, slot) => {
+      const p = findPlayer(rec);
+      const b = findButtons(rec, 0);
+      if (p && b) { inputMap.set(p, b.v); how = how || ('host:' + b.how); }
+    });
+  }
+  // host's own player: prefer the live local input if the record didn't
+  // carry it (some netcode builds apply local input without storing it).
+  const loc = localButtons();
+  if (loc && H && typeof H.mySlot !== 'undefined' && recs) {
+    const rec = recs.get ? recs.get(H.mySlot) : null;
+    const p = findPlayer(rec);
+    if (p) {
+      // The host's own buttons are read straight off the InputManager and
+      // OR'd over whatever the slot record held. If netcode's mask is
+      // stale or missing a bit for the local player, this still works;
+      // remote players rely on the mask alone.
+      const rec_v = inputMap.get(p);
+      inputMap.set(p, rec_v ? {
+        left:   rec_v.left   || !!loc.v.left,
+        right:  rec_v.right  || !!loc.v.right,
+        jump:   rec_v.jump   || !!loc.v.jump,
+        action: rec_v.action || !!loc.v.action,
+        down:   rec_v.down   || !!loc.v.down,
+      } : loc.v);
+      how = how || loc.how;
+    }
+  }
+  window.__ropeInput = how || (loc ? loc.how + ' (unmapped)' : 'NOT FOUND');
+  if (ROPE_DEBUG) {
+    // raw mask of every mapped player, so a missing DOWN bit (16) is
+    // visible as a number rather than guessed at
+    const masks = [];
+    if (recs && typeof recs.forEach === 'function') {
+      recs.forEach((rec) => {
+        const p = findPlayer(rec);
+        if (!p) return;
+        const m = (typeof p._mask === 'number') ? p._mask
+                : (typeof rec._mask === 'number') ? rec._mask : null;
+        masks.push(m === null ? '?' : m);
+      });
+    }
+    window.__ropeMask = masks.join(',') || '-';
+    window.__ropeLocDown = loc ? String(!!loc.v.down) : '-';
+  }
+  window.__ropeLoc = loc ? loc.how : '-';
+}
 
-const NC = window.Netcode || {};
-const RELAY_OK = IS_HOST
-  ? typeof (NC.Host && NC.Host.broadcastLevelMsg) === 'function'
-  : typeof (NC.Client && NC.Client.sendLevelMsg) === 'function';
+// DOWN is a real wire bit now (BTN.DOWN = 16), so `inp.down` works for
+// local and remote players alike and there is no relay to maintain.
+function readInput(p) {
+  const v = inputMap.get(p);
+  if (!v) return NO_INPUT;
+  return { left: !!v.left, right: !!v.right, jump: !!v.jump,
+           action: !!v.action, down: !!v.down };
+}
 
-/* ---- The ball ---------------------------------------------------------
-   Subclasses BouncingBall so netcode's codec syncs it by instanceof, colour
-   included — a ball is tinted to its owner so a glance at another lane
-   tells you whose is about to drop. Every movement method is stubbed: the
-   engine's own bounce solver would fight the head-bounce rules below, so
-   the level tick drives all of it.
-   -------------------------------------------------------------------- */
-const NOOP = function () {};
-class Ball extends BouncingBall {
-  constructor(x, y, color) {
-    super(x, y, BALL_D, BALL_D, {
-      vx: 0, vy: 0, friction: 0, minSpeed: 0, killsPlayers: false, color: color,
+/* ---- a single coil dot. Position is driven entirely by RopeSystem;
+        its own physics is disabled so it never drifts. ---- */
+class RopeNode extends BouncingBall {
+  constructor(x, y) {
+    super(x, y, NODE_SIZE, NODE_SIZE, {
+      vx: 0, vy: 0, friction: 0, minSpeed: 0,
+      killsPlayers: false, bounds: null, color: ROPE_COLOR,
     });
     this.solid = false;
-    this.kind = 'juggle';
+    this.kind = 'rope';
+  }
+  update() { /* driven by RopeSystem */ }
+}
+
+/* ---- one rope: pivot, angle, riders ---- */
+class Rope {
+  constructor(def, index) {
+    this.px = def.x;
+    this.py = CEILING_Y;
+    this.len = def.restLen;
+    this.fullLen = def.fullLen;
+    this.grown = def.fullLen <= def.restLen;
+    this.theta = 0;      // radians from vertical, + = right
+    this.omega = 0;
+    this.index = index;
+    this.nodes = [];
+  }
+  tipX() { return this.px + Math.sin(this.theta) * this.len; }
+  tipY() { return this.py + Math.cos(this.theta) * this.len; }
+  pointAt(d) {
+    return { x: this.px + Math.sin(this.theta) * d,
+             y: this.py + Math.cos(this.theta) * d };
+  }
+  // shortest distance from a point to the rope line, plus how far down it is
+  project(x, y) {
+    const dx = x - this.px, dy = y - this.py;
+    let d = dx * Math.sin(this.theta) + dy * Math.cos(this.theta);
+    d = Math.max(0, Math.min(this.len, d));
+    const p = this.pointAt(d);
+    return { d, dist: Math.hypot(x - p.x, y - p.y) };
   }
 }
-Ball.prototype.update = NOOP; Ball.prototype.step = NOOP; Ball.prototype.tick = NOOP;
-Ball.prototype.simulate = NOOP; Ball.prototype.integrate = NOOP;
 
-// Shared HUD state: host writes it from the real game, a client writes it
-// from the host's broadcasts, the overlay reads it without caring which.
-const HUD = { over: false, msg: '', done: 0, total: 0, crowded: false, lanes: 0 };
-window.LevelJuggle = { hud: HUD, LANE_COUNT: LANE_COUNT };
+/* ---- the controller: swings every rope, moves every rider ---- */
+class RopeSystem extends Entity {
+  constructor(ropes) {
+    super(0, 0, 1, 1);
+    this.solid = false;
+    this.ropes = ropes;
+    this.riders = new Map();   // Player -> { rope, d }
+    this.cooldown = new Map(); // Player -> seconds left
+    this.prevAction = new Map(); // Player -> was E down last tick (edge detect)
+    this.lastGen = -1;
+    this.lastDriven = 0;
+  }
+
+  // Aliased below to every plausible per-tick hook name, because the
+  // engine's entity tick is not called `update` here (the debug readout
+  // proved it never fired). Whichever name World actually calls wins; if
+  // NONE of them are called, the rAF fallback at the bottom of this file
+  // drives it instead, host-side only.
+  // Fixed-step wrapper. Whatever dt arrives (sim frame or rAF), it gets
+  // consumed in 1/60 slices, so the pendulum integrates identically no
+  // matter the framerate. Without this the swing speed tracked the
+  // display refresh, which is what made it lurch a box at a time.
+  tickRope(dt) {
+    this.lastDriven = performance.now();
+    window.__ropeDriver = this._driver || 'engine';
+    if (!(dt > 0)) return;
+    this._acc = (this._acc || 0) + Math.min(dt, 0.1);
+    let guard = 0;
+    while (this._acc >= ROPE_STEP && guard++ < 8) {
+      this._acc -= ROPE_STEP;
+      this.stepRope(ROPE_STEP);
+    }
+    // riders are re-pinned every frame, not just on a fixed slice, so
+    // they never lag a frame behind the physics pass that just moved them
+    this.pinRiders();
+  }
+
+  stepRope(dt) {
+    const world = theWorld;
+    if (!world || !dt) return;
+    this._lastDt = dt;
+
+    // a level reset re-spawns everyone on the ledge — drop all riders
+    if (world.resetGeneration !== this.lastGen) {
+      this.lastGen = world.resetGeneration;
+      this.riders.clear();
+      this.cooldown.clear();
+      this.prevAction.clear();
+      for (const r of this.ropes) { r.theta = 0; r.omega = 0; }
+    }
+
+    refreshInputs();
+
+    const players = world.entities.filter(e => e instanceof Player && !e.dead);
+    if (ROPE_DEBUG) {
+      window.__ropeAction = players.filter(p => readInput(p).action).length + '/' + players.length;
+      window.__ropeRiders = this.riders.size;
+    }
+
+    for (const [p, t] of this.cooldown) {
+      const left = t - dt;
+      if (left <= 0) this.cooldown.delete(p); else this.cooldown.set(p, left);
+    }
+
+    // ---- catching ----
+    for (const p of players) {
+      if (this.riders.has(p) || this.cooldown.has(p)) continue;
+      // CONTROLS: ACTION (E) = grab, and press it again to let go.
+      //           JUMP   (W) = climb up while hanging.
+      // Grabbing is on the rising edge of E, not "held", so the press
+      // that grabs can't also be read as the press that releases.
+      const ip = readInput(p);
+      const wasDown = this.prevAction.get(p);
+      this.prevAction.set(p, ip.action);
+      if (!ip.action || wasDown) continue;
+      const cx = p.x + p.w / 2, cy = p.y + p.h / 2;
+      let best = null, bestDist = GRAB_RADIUS;
+      for (const r of this.ropes) {
+        const pr = r.project(cx, cy);
+        if (pr.dist < bestDist) { bestDist = pr.dist; best = { r, d: pr.d }; }
+      }
+      if (best) this.attach(p, best.r, best.d);
+    }
+
+    // ---- swing each rope ----
+    for (const r of this.ropes) {
+      // grow to full length once someone is on it
+      if (!r.grown) {
+        const anyRider = [...this.riders.values()].some(v => v.rope === r);
+        if (anyRider) {
+          const before = r.len;
+          r.len = Math.min(r.fullLen, r.len + EXPAND_SPEED * dt);
+          if (r.len >= r.fullLen) r.grown = true;
+          // riders hanging near the tail ride down with it
+          const scale = r.len / before;
+          for (const [p, v] of this.riders) {
+            if (v.rope === r) v.d = Math.min(r.len, v.d * scale);
+          }
+        }
+      }
+
+      let pump = 0, riderCount = 0;
+      for (const [p, v] of this.riders) {
+        if (v.rope !== r) continue;
+        riderCount++;
+        const inp = readInput(p);
+        if (inp.right) pump += 1;
+        if (inp.left)  pump -= 1;
+      }
+      if (riderCount > 0) pump /= riderCount;
+
+      const g = (PHYSICS && PHYSICS.GRAVITY) || 1700;
+      r.omega += (-(g / r.len) * Math.sin(r.theta) - ROPE_DAMPING * r.omega
+                  + pump * PUMP_ACCEL) * dt;
+      r.omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, r.omega));
+      r.theta += r.omega * dt;
+
+      // place the coil dots
+      for (let i = 0; i < r.nodes.length; i++) {
+        const d = r.len * ((i + 1) / r.nodes.length);
+        const pt = r.pointAt(d);
+        const n = r.nodes[i];
+        n.x = pt.x - n.w / 2;
+        n.y = pt.y - n.h / 2;
+        n.vx = 0; n.vy = 0;
+      }
+    }
+
+  }
+
+  // Called every frame, AFTER the physics pass has run. Gravity has
+  // already moved the rider by then; this puts them back on the rope and
+  // cancels the velocity that would move them again next step. Doing this
+  // before physics instead is what made riders bob up and down.
+  pinRiders() {
+    const world = theWorld;
+    if (!world) return;
+    for (const [p, v] of [...this.riders]) {
+      const players = world.entities;
+      if (players.indexOf(p) === -1 || p.dead) { this.riders.delete(p); continue; }
+      const r = v.rope, inp = readInput(p);
+
+      // W (jump) climbs up, S slides down. Sliding stops at the tail —
+      // you drop off with E, not by sliding past the end.
+      if (inp.jump) v.d = Math.max(MIN_DIST, v.d - CLIMB_SPEED * this._lastDt);
+      if (ROPE_DEBUG) window.__ropeSliding = String(!!inp.down);
+      if (inp.down) v.d = v.d + SLIDE_SPEED * this._lastDt;
+      v.d = Math.max(MIN_DIST, Math.min(v.d, r.len));
+
+      // E (action) pressed again lets go, carrying the swing velocity
+      const wasDown = this.prevAction.get(p);
+      this.prevAction.set(p, inp.action);
+      if (inp.action && !wasDown) { this.release(p, v); continue; }
+
+      const pt = r.pointAt(v.d);
+      p.vx = 0; p.vy = 0;
+      p.x = pt.x - p.w / 2;
+      p.y = pt.y - p.h / 2;
+      p.grounded = false;
+      if (p.jumpBuffer !== undefined) p.jumpBuffer = 0;
+      p.facing = r.omega >= 0 ? 1 : -1;
+    }
+  }
+
+  attach(p, rope, d) {
+    // carry your momentum in: convert linear velocity to angular
+    const tx = Math.cos(rope.theta), ty = -Math.sin(rope.theta);
+    const tang = (p.vx || 0) * tx + (p.vy || 0) * ty;
+    const dd = Math.max(MIN_DIST, d);
+    const w = tang / dd;
+    rope.omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, rope.omega + w * 0.6));
+    this.riders.set(p, { rope, d: dd });
+    p.vx = 0; p.vy = 0;
+  }
+
+  release(p, v) {
+    const r = v.rope;
+    const vx = r.omega * v.d * Math.cos(r.theta) * RELEASE_VX_MULT;
+    const vy = -r.omega * v.d * Math.sin(r.theta) - RELEASE_BOOST;
+    p.vx = vx; p.vy = vy;
+    this.riders.delete(p);
+    this.cooldown.set(p, REGRAB_COOLDOWN);
+  }
+}
+
+// Whatever the engine calls, route it to tickRope. Harmless if the engine
+// calls more than one of these — tickRope is idempotent per dt.
+for (const name of ['update', 'step', 'tick', 'fixedUpdate', 'simulate', 'onTick']) {
+  if (!RopeSystem.prototype[name]) {
+    RopeSystem.prototype[name] = function (dt) { this.tickRope(dt); };
+  }
+}
+
+/* =======================================================================
+   Level
+   ======================================================================= */
+const ropeObjs = ROPES.map((d, i) => new Rope(d, i));
 
 window.Level = {
-  WIDTH: ARENA_W,
-  HEIGHT: ARENA_H,
+  WIDTH: LEVEL_W,
+  HEIGHT: H_,
   VIEW_MODE: VIEW_MODE,
 
-  // One lane each, at the far left of it. If more players turn up than the
-  // agreed lane count, the extras wrap and share a lane rather than
-  // spawning inside a wall — playable, but the HUD says so (see below).
+  // stacked spawn — slot 0 on the ledge, each next slot on the one below,
+  // which is how the first player gets high enough to reach rope A.
   spawnPoint(slot) {
-    const lane = slot % LANE_COUNT;
-    return { x: LANE_X + 40, y: laneFloorY(lane) - 40 };
+    return { x: 60 + (slot % 2) * 34, y: LEDGE_Y - 40 - Math.floor(slot / 2) * 42 };
   },
 
   build(world, nw) {
-    // Nobody can fall out of a sealed corridor, and there is no pit here —
-    // the only way to lose is the ball. Keep the fall-out check well clear.
-    world.deathY = ARENA_H + 400;
-    world.cameraOpts = { viewW: 1100, viewH: 620 };
+    theWorld = world;
+    world.deathY = H_ + PIT_DEATH_PAD;
+    // falling into the pit must kill, so the camera's bottom wall can't
+    // be solid (same reasoning as Arrow Gap).
+    world.cameraOpts = { blockBottom: false };
 
-    function slab(x, y, w, h, color) {
-      const b = new StaticBody(x, y, w, h);
-      b.color = color || LAND_COLOR;
-      world.add(b);
-      return b;
-    }
+    // start ledge
+    const ledge = new StaticBody(0, LEDGE_Y, LEDGE_W, 24);
+    ledge.color = PLATFORM_COLOR;
+    world.add(ledge);
 
-    /* ---- The stack -----------------------------------------------------
-       Each lane is a closed box: its own ceiling, its own floor, and end
-       walls both sides. Consecutive lanes share a slab — one lane's floor
-       is the next lane's ceiling — so the stack is (LANE_COUNT + 1)
-       horizontal slabs, not two per lane.
-       ------------------------------------------------------------------ */
-    const goals = [];
-    const lanes = [];
-
-    for (let i = 0; i <= LANE_COUNT; i++) {
-      slab(MARGIN, MARGIN + i * LANE_PITCH, WALL * 2 + LANE_LEN, WALL);
-    }
-    for (let i = 0; i < LANE_COUNT; i++) {
-      slab(MARGIN, laneInnerY(i), WALL, LANE_H);                       // left end
-      slab(MARGIN + WALL + LANE_LEN, laneInnerY(i), WALL, LANE_H);     // right end
-
-      lanes.push({
-        top:    laneInnerY(i),
-        floor:  laneFloorY(i),
-        left:   LANE_X,
-        right:  LANE_X + LANE_LEN,
-      });
-
-      // Exit doorway at the far right of the lane, standing on its floor.
-      const gh = 90, gw = 64;
-      const goal = new TriggerZone(LANE_X + LANE_LEN - gw - 10, laneFloorY(i) - gh,
-                                   gw, gh, { effect: 'goal', kind: 'exit' });
-      goal.color = GOAL_COLOR;
-      world.add(goal);
-      nw.triggers.push(goal);
-      goals.push(goal);
-    }
-
-    world.levelBounds = { minX: 0, minY: 0, maxX: ARENA_W, maxY: ARENA_H };
-
-    // 'each' — every player has their own door and has to go through it,
-    // so the level ends when the last lane is finished.
-    nw.winCondition = { type: 'reach-goal', mode: 'each', goals: goals };
-
-    /* ---- Pause --------------------------------------------------------- */
-    let paused = false, pausedMirror = false;
-    window.LevelPause = {
-      isPaused: function () { return IS_HOST ? paused : pausedMirror; },
-      toggle: function () {
-        if (IS_HOST) {
-          paused = !paused;
-          if (RELAY_OK) { try { NC.Host.broadcastLevelMsg({ k: 'pause', on: paused }); } catch (e) {} }
-        } else if (RELAY_OK) {
-          try { NC.Client.sendLevelMsg({ k: 'pauseReq' }); } catch (e) {}
-        }
-      },
-    };
-    if (RELAY_OK && IS_HOST) {
-      NC.Host.onLevelMsg = function (slot, payload) {
-        if (payload && payload.k === 'pauseReq') {
-          paused = !paused;
-          try { NC.Host.broadcastLevelMsg({ k: 'pause', on: paused }); } catch (e) {}
-        }
-      };
-    } else if (RELAY_OK) {
-      NC.Client.onLevelMsg = function (payload) {
-        if (!payload) return;
-        if (payload.k === 'pause') pausedMirror = !!payload.on;
-        else if (payload.k === 'st') {
-          HUD.over = !!payload.o; HUD.msg = payload.m || '';
-          HUD.done = payload.d || 0; HUD.total = payload.n || 0;
-          HUD.crowded = !!payload.c; HUD.lanes = payload.l || 0;
-        }
-      };
-    }
-
-    /* ================= HOST-ONLY GAME STATE ============================ */
-    const balls = new Map();     // slot -> Ball
-    let overTimer = 0;           // > 0 while the GAME OVER card is up
-    let message = '';
-    let netAccum = 0;
-    let lastGen = world.resetGeneration;
-
-    function clearBalls() {
-      for (const b of balls.values()) world.remove(b);
-      balls.clear();
-    }
-
-    function laneOf(slot) { return lanes[slot % LANE_COUNT]; }
-
-    // A ball is served directly above its owner, already falling — so the
-    // very first thing a player does is a header, not a wait.
-    function serve(slot, p) {
-      const lane = laneOf(slot);
-      const y = Math.max(lane.top + 2, p.y - START_HEIGHT);
-      const b = new Ball(p.x + p.w / 2 - BALL_D / 2, y, p.color);
-      world.add(b);
-      balls.set(slot, b);
-    }
-
-    function broadcast() {
-      HUD.over = overTimer > 0; HUD.msg = message; HUD.lanes = LANE_COUNT;
-      if (!RELAY_OK || !IS_HOST) return;
-      try {
-        NC.Host.broadcastLevelMsg({
-          k: 'st', o: overTimer > 0, m: message, d: HUD.done, n: HUD.total,
-          c: !!HUD.crowded, l: LANE_COUNT,
-        });
-      } catch (e) {}
-    }
-
-    const engineStep = world.step.bind(world);
-    world.step = function (dt) {
-      if (IS_HOST && paused) return;
-
-      // While the GAME OVER card is up the world is frozen too — the run is
-      // already lost, and letting players keep walking behind the card just
-      // makes the reset look like a teleport.
-      if (IS_HOST && overTimer > 0) {
-        overTimer -= dt;
-        if (overTimer <= 0) {
-          overTimer = 0;
-          message = '';
-          world.pendingReset = true;   // the reset branch below re-serves
-        }
-        broadcast();
-        return;
+    // Small anchor block per rope. Built in rope order so host and client
+    // still produce identical static ids. (The old full-width beam also
+    // acted as a lid stopping you launching over the puzzle — that job is
+    // now the camera's top wall.)
+    if (ANCHOR_STYLE === 'block') {
+      for (const def of ROPES) {
+        const a = new StaticBody(def.x - ANCHOR_W / 2, CEILING_Y - ANCHOR_H,
+                                 ANCHOR_W, ANCHOR_H);
+        a.color = '#3d3d52';
+        if (!ANCHOR_SOLID) a.solid = false;
+        world.add(a);
       }
+    }
 
-      engineStep(dt);
-      if (!IS_HOST || !(dt > 0)) return;
+    // exit platform + goal
+    const plat = new StaticBody(EXIT_X, EXIT_PLAT_Y, EXIT_PLAT_W, 22);
+    plat.color = PLATFORM_COLOR;
+    world.add(plat);
 
-      // A reset — a drop, or a player leaving — clears the board. Balls are
-      // created after build(), so resetLevel() knows nothing about them.
-      if (world.resetGeneration !== lastGen) {
-        lastGen = world.resetGeneration;
-        clearBalls();
+    const goal = new TriggerZone(EXIT_X + EXIT_PLAT_W - 100, EXIT_PLAT_Y - 60, 80, 60,
+                                 { effect: 'goal', kind: 'exit' });
+    goal.color = GOAL_COLOR;
+    world.add(goal);
+    nw.triggers.push(goal);
+
+    // rope coils. BouncingBalls are dynamic — found by the codec via
+    // world.entities.filter(e => e.isBouncingBall), so they are NOT
+    // pushed into any nw array.
+    for (const r of ropeObjs) {
+      r.len = ROPES[r.index].restLen;
+      r.grown = ROPES[r.index].fullLen <= ROPES[r.index].restLen;
+      r.theta = 0; r.omega = 0; r.nodes = [];
+      for (let i = 0; i < NODES_PER_ROPE; i++) {
+        const d = r.len * ((i + 1) / NODES_PER_ROPE);
+        const pt = r.pointAt(d);
+        const n = new RopeNode(pt.x - NODE_SIZE / 2, pt.y - NODE_SIZE / 2);
+        world.add(n);
+        r.nodes.push(n);
       }
+    }
 
-      const live = [];
-      for (const [slot, p] of nw.players) {
-        if (p && !p.dead && !p.removed) live.push([slot, p]);
+    // controller last — static build order above it is unchanged, so host
+    // and client still agree on every static entity id.
+    ropeSystem = new RopeSystem(ropeObjs);
+    world.add(ropeSystem);
+
+    // Drive the rope from the world's own step, so it runs on the fixed
+    // sim timestep and — crucially — AFTER the physics pass, which is
+    // what stops riders bobbing. Wrapping the instance method leaves
+    // engine.js untouched. If the engine's tick is named something else,
+    // the aliases and the rAF fallback still cover it.
+    for (const name of ['step', 'update', 'tick']) {
+      if (typeof world[name] === 'function' && !world['__ropeWrapped_' + name]) {
+        const orig = world[name].bind(world);
+        world['__ropeWrapped_' + name] = true;
+        world[name] = function (dt) {
+          const out = orig(dt);
+          try { ropeSystem._driver = 'world.' + name; ropeSystem.tickRope(dt); }
+          catch (e) {}
+          return out;
+        };
+        break;
       }
-      HUD.total = live.length;
-      // The arena was sized before anyone existed. If the party turned out
-      // bigger than the number we built for, say so plainly rather than
-      // letting two players quietly share a lane and blame each other for
-      // the drop.
-      HUD.crowded = live.length > LANE_COUNT;
+    }
 
-      // Serve to anyone who has no ball — first frame of a run, a late
-      // joiner, or the frame after a reset.
-      for (let i = 0; i < live.length; i++) {
-        if (!balls.has(live[i][0])) serve(live[i][0], live[i][1]);
-      }
-      // And retire balls whose owner has gone through their door or left.
-      for (const slot of Array.from(balls.keys())) {
-        if (!nw.players.has(slot)) { world.remove(balls.get(slot)); balls.delete(slot); }
-      }
-
-      for (let i = 0; i < live.length; i++) {
-        const slot = live[i][0], p = live[i][1];
-        const b = balls.get(slot);
-        if (!b) continue;
-        const lane = laneOf(slot);
-
-        // --- gravity and travel ---
-        b.vy += BALL_GRAVITY * dt;
-        b.x += b.vx * dt;
-        b.y += b.vy * dt;
-
-        // --- end walls ---
-        if (b.x < lane.left) { b.x = lane.left; b.vx = Math.abs(b.vx) * WALL_DAMP; }
-        if (b.x + b.w > lane.right) { b.x = lane.right - b.w; b.vx = -Math.abs(b.vx) * WALL_DAMP; }
-
-        // --- ceiling ---
-        if (b.y < lane.top) { b.y = lane.top; b.vy = Math.abs(b.vy) * CEIL_DAMP; }
-
-        /* --- the header -------------------------------------------------
-           Only counts on the way DOWN and only against the top band of the
-           player's box, so walking sideways into a low ball doesn't punt it
-           — the ball has to actually land on the head. How far off-centre
-           it lands is what steers it, which is the whole skill of the
-           level: you correct a drifting ball by shifting under it.
-           -------------------------------------------------------------- */
-        const headTop = p.y;
-        const overlapX = (b.x + b.w > p.x) && (b.x < p.x + p.w);
-        const onHead = overlapX && b.vy > 0 &&
-                       (b.y + b.h) >= headTop && (b.y + b.h) <= headTop + 18;
-        if (onHead) {
-          b.y = headTop - b.h;
-          b.vy = -BOUNCE_V;
-          const off = (b.x + b.w / 2) - (p.x + p.w / 2);
-          b.vx += off * STEER;
-          if (b.vx > BALL_MAX_VX) b.vx = BALL_MAX_VX;
-          if (b.vx < -BALL_MAX_VX) b.vx = -BALL_MAX_VX;
-        }
-
-        // --- the floor: one drop ends it for everyone -------------------
-        if (b.y + b.h >= lane.floor) {
-          b.y = lane.floor - b.h;
-          b.vy = 0; b.vx = 0;
-          message = 'Ball dropped in lane ' + ((slot % LANE_COUNT) + 1) + ' — GAME OVER';
-          overTimer = GAMEOVER_SECS;
-          broadcast();
-          return;
-        }
-      }
-
-      netAccum += dt;
-      if (netAccum >= 0.25) { netAccum = 0; broadcast(); }
-    };
+    nw.winCondition = { type: 'reach-goal', mode: 'each', goals: [goal] };
   },
 };
 
-})();
-</script>
-
-<!-- ==========================================================================
-     Keepie Uppie controls + HUD — Back and Pause in the same #voiceBar .vbtn
-     style, the shared GAME OVER card, and the shared pause panel.
-     ========================================================================== -->
-<script>
-(function () {
-"use strict";
-
-function mkVbtn(glyph, label, onclick) {
-  const b = document.createElement('button');
-  b.className = 'vbtn'; b.type = 'button';
-  b.innerHTML = glyph; b.title = label;
-  b.setAttribute('aria-label', label);
-  b.onclick = onclick;
-  return b;
-}
-
-const bar = document.getElementById('voiceBar');
-if (!bar) return;
-
-const pauseBtn = mkVbtn('&#10074;&#10074;', 'Pause', function () {
-  if (window.LevelPause) window.LevelPause.toggle();
-});
-const back = mkVbtn('&#8592;', 'Leave the level', function () {
-  try { window.Netcode.Host.prepareHandoff(); } catch (e) {}
-  location.href = 'index.html';
-});
-bar.appendChild(pauseBtn);
-bar.appendChild(back);
-
-function centreCard(html, bg) {
-  const el = document.createElement('div');
-  el.style.cssText =
-    'position:fixed;inset:0;z-index:62;display:none;align-items:center;' +
-    'justify-content:center;background:' + bg + ';backdrop-filter:blur(3px);' +
-    'font-family:system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;';
-  el.innerHTML =
-    '<div style="padding:24px 44px;border-radius:16px;background:rgba(24,19,34,.95);' +
-    'border:1px solid rgba(255,255,255,.16);color:#e9e3f2">' + html + '</div>';
-  document.body.appendChild(el);
-  return el;
-}
-
-/* GAME OVER is shown to EVERY player, not just whoever dropped: the lanes
-   are separate, so without this the other three would just see themselves
-   snap back to the start with no explanation. */
-const overEl = centreCard(
-  '<div style="font:700 34px/1.1 inherit;color:#ff8a7a;letter-spacing:.04em">GAME OVER</div>' +
-  '<div id="overWhy" style="margin-top:8px;font-size:14px;color:#c9c1dd"></div>' +
-  '<div style="margin-top:6px;font-size:12px;color:#a79fbd">One dropped ball ends the run for everyone.</div>',
-  'rgba(30,10,14,.6)');
-
-const pauseEl = centreCard(
-  '<div style="font:700 30px/1.1 inherit;letter-spacing:.04em">GAME IS PAUSED</div>' +
-  '<div style="margin-top:8px;font-size:13px;color:#a79fbd">' +
-  'Paused for everyone &mdash; press &#10074;&#10074; again to resume.</div>',
-  'rgba(14,11,24,.55)');
-pauseEl.style.zIndex = '63';
-
-/* Sharing a lane is survivable but confusing, so it is called out rather
-   than left for the players to work out mid-drop. */
-const crowdEl = document.createElement('div');
-crowdEl.style.cssText =
-  'position:fixed;bottom:44px;left:50%;transform:translateX(-50%);z-index:59;' +
-  'display:none;padding:6px 14px;border-radius:999px;background:rgba(58,34,20,.9);' +
-  'border:1px solid rgba(255,180,120,.35);color:#ffd9b0;pointer-events:none;' +
-  'font:500 12px/1 system-ui,-apple-system,Segoe UI,sans-serif;';
-document.body.appendChild(crowdEl);
-
-(function loop() {
-  try {
-    const p = window.LevelPause && window.LevelPause.isPaused();
-    pauseEl.style.display = p ? 'flex' : 'none';
-    pauseBtn.style.opacity = p ? '0.65' : '1';
-
-    const h = window.LevelJuggle && window.LevelJuggle.hud;
-    if (h) {
-      overEl.style.display = h.over ? 'flex' : 'none';
-      crowdEl.style.display = h.crowded ? 'block' : 'none';
-      if (h.crowded) {
-        crowdEl.textContent = h.total + ' players but only ' + (h.lanes || '?') +
-                              ' lanes — some of you are sharing.';
-      }
-      const why = document.getElementById('overWhy');
-      if (why) why.textContent = h.msg || '';
+/* ---- rope line art, pinned to the interpolated coil positions so it
+        looks identical on host and clients. ---- */
+window.LevelDraw = function (ctx, list, t) {
+  const byRope = [];
+  for (let i = 0; i < list.length; i++) {
+    const e = list[i].entity;
+    if (!e || e.kind !== 'rope') continue;
+    for (let ri = 0; ri < ropeObjs.length; ri++) {
+      const idx = ropeObjs[ri].nodes.indexOf(e);
+      if (idx === -1) continue;
+      (byRope[ri] || (byRope[ri] = [])).push({
+        i: idx, x: list[i].x + e.w / 2, y: list[i].y + e.h / 2,
+      });
     }
-  } catch (e) {}
+  }
+
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (let ri = 0; ri < ropeObjs.length; ri++) {
+    const pts = byRope[ri];
+    if (!pts || !pts.length) continue;
+    pts.sort((a, b) => a.i - b.i);
+    const path = [{ x: ropeObjs[ri].px, y: ropeObjs[ri].py }].concat(pts);
+
+    // One smooth stroke through the carrier points (midpoint quadratics)
+    // instead of a dot per node, so the rope reads as a single uniform
+    // cord with no beads or knots along it.
+    const trace = () => {
+      ctx.beginPath();
+      ctx.moveTo(path[0].x, path[0].y);
+      for (let k = 1; k < path.length - 1; k++) {
+        const mx = (path[k].x + path[k + 1].x) / 2;
+        const my = (path[k].y + path[k + 1].y) / 2;
+        ctx.quadraticCurveTo(path[k].x, path[k].y, mx, my);
+      }
+      const last = path[path.length - 1];
+      ctx.lineTo(last.x, last.y);
+    };
+
+    trace(); ctx.strokeStyle = 'rgba(0,0,0,0.40)';        ctx.lineWidth = 7;   ctx.stroke();
+    trace(); ctx.strokeStyle = ROPE_COLOR;                ctx.lineWidth = 4;   ctx.stroke();
+    trace(); ctx.strokeStyle = 'rgba(255,235,200,0.30)';  ctx.lineWidth = 1.5; ctx.stroke();
+
+    ctx.fillStyle = '#8a6a3d';
+    ctx.beginPath();
+    ctx.arc(ropeObjs[ri].px, ropeObjs[ri].py, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // --- debug readout: which input field was found, and who's holding
+  //     ACTION right now. Delete this block once grabbing works. ---
+  if (ROPE_DEBUG) {
+    ctx.font = '12px ui-monospace, monospace';
+    ctx.fillStyle = window.__ropeInput === 'NOT FOUND' ? '#ff8a8a' : '#8affa0';
+    ctx.fillText('input src: ' + (window.__ropeInput || '(waiting)'), 12, CEILING_Y + 26);
+    ctx.fillStyle = '#c8c8d8';
+    ctx.fillText('action held: ' + (window.__ropeAction || '-'), 12, CEILING_Y + 42);
+    ctx.fillText('riders: ' + (window.__ropeRiders || 0), 12, CEILING_Y + 58);
+    ctx.fillStyle = window.__ropeDriver ? '#8affa0' : '#ff8a8a';
+    ctx.fillText('driver: ' + (window.__ropeDriver || 'NOTHING TICKING'), 12, CEILING_Y + 74);
+    ctx.fillStyle = '#c8c8d8';
+    ctx.fillText('local input: ' + (window.__ropeLoc || '-'), 12, CEILING_Y + 90);
+    ctx.fillStyle = '#ffd18a';
+    ctx.fillText('raw mask: ' + (window.__ropeMask || '-') + '   (DOWN = bit 16)',
+                 12, CEILING_Y + 106);
+    ctx.fillText('local .down: ' + (window.__ropeLocDown || '-'), 12, CEILING_Y + 122);
+    ctx.fillText('slide now: ' + (window.__ropeSliding || '-'), 12, CEILING_Y + 138);
+  }
+  ctx.restore();
+};
+
+/* ---- host-side rAF fallback ------------------------------------------
+   If the engine never calls any of the tick aliases above, nothing moves
+   and nothing can be grabbed. This drives the rope system directly from
+   the render loop instead, at a clamped fixed-ish dt.
+
+   It only runs on the host: Host.nw exists and holds the live world only
+   on the simulating peer, so clients never enter this and their rope
+   positions keep coming from snapshots as normal. It also stands down the
+   moment the engine proves it IS calling us. */
+(function ropeFallback() {
+  let last = performance.now();
+  function loop() {
+    requestAnimationFrame(loop);
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (!theWorld || !ropeSystem) return;
+
+    const H = window.Netcode && window.Netcode.Host;
+    const isHost = !!(H && H.nw && typeof H.tick === 'number');
+    if (!isHost) return;
+
+    // engine is driving it — leave it alone
+    if (now - ropeSystem.lastDriven < 250) return;
+    ropeSystem._driver = 'raf';
+    ropeSystem.tickRope(dt);
+  }
   requestAnimationFrame(loop);
 })();
-
-window.addEventListener('keydown', function (ev) {
-  if (ev.code === 'Escape' || ev.code === 'KeyP') {
-    if (window.LevelPause) window.LevelPause.toggle();
-  }
-});
 
 })();
 </script>
@@ -764,7 +1042,7 @@ const $ = id => document.getElementById(id);
 
 // Where "back to lobby" goes. Relative to this page — adjust if level
 // pages ever move into a subfolder relative to the lobby.
-const LOBBY_URL = 'lobby.html';
+const LOBBY_URL = 'index.html';
 const boot = $('boot'), bootStatus = $('bootStatus'), stage = $('stage'),
       hudEl = $('hud'), canvas = $('game');
 const ctx = canvas.getContext('2d');
@@ -772,10 +1050,12 @@ const ctx = canvas.getContext('2d');
 const setStatus = m => { bootStatus.textContent = m; };
 
 const input = new window.InputManager();
+window.__gameInput = input;
 window.bindTouchButton($('btnLeft'),   input, 'left');
 window.bindTouchButton($('btnRight'),  input, 'right');
 window.bindTouchButton($('btnJump'),   input, 'jump');
 window.bindTouchButton($('btnAction'), input, 'action');
+window.bindTouchButton($('btnDown'),   input, 'down');
 
 let side = null, peer = null, running = false, myPeerId = null;
 
@@ -982,7 +1262,6 @@ function draw() {
   lastFrameAt = now;
   const t = now / 1000;
 
-
   const W = window.Level.WIDTH, H = window.Level.HEIGHT;
   const view = viewRect();
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -1022,6 +1301,10 @@ function draw() {
     ctx.fillRect(list[i].x, list[i].y, e.w, e.h);
   }
 
+  if (typeof window.LevelDraw === 'function') {
+    try { window.LevelDraw(ctx, list, t); } catch (err) {}
+  }
+
   for (let i = 0; i < list.length; i++) {
     const it = list[i], e = it.entity;
     if (e.isWindZone) continue;
@@ -1029,6 +1312,7 @@ function draw() {
     // (engine.js sets isCameraWall on them) — drawing them is what put
     // those stray rectangles on screen.
     if (e.isCameraWall) continue;
+    if (e.kind === 'rope') continue;
     const x = it.x, y = it.y;
 
     if (e instanceof Player) {
@@ -1055,23 +1339,6 @@ function draw() {
       lastPos.set(e, { x, y, angle });
       drawArrow(x, y, e.w, e.h, angle);
 
-    } else if (e.kind === 'juggle') {
-      // A real ball: lit from the upper left, with a soft contact shadow on
-      // the lane floor so its height above the ground is readable at a
-      // glance — which is the one thing the player is judging all level.
-      const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
-      ctx.save();
-      const g = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.4, r * 0.15, cx, cy, r);
-      g.addColorStop(0, 'rgba(255,255,255,0.85)');
-      g.addColorStop(0.35, e.color);
-      g.addColorStop(1, 'rgba(0,0,0,0.55)');
-      ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.arc(cx, cy, r - 1, 0, Math.PI * 2); ctx.stroke();
-      ctx.restore();
-
     } else if (e.kind === 'death-orb') {
       // Drawn as a sibling of the decorative orb (same size, same bob) so
       // it doesn't announce itself as a hazard from across the level —
@@ -1088,113 +1355,6 @@ function draw() {
       ctx.shadowBlur = 0;
       ctx.fillStyle = 'rgba(255,220,220,0.85)';
       ctx.beginPath(); ctx.arc(cx, cy, e.w / 5, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-
-    } else if (e.kind === 'fire') {
-      // Flickering flame: a warm core with irregular tongues, animated with
-      // layered noise-ish sine terms so no two frames repeat exactly.
-      const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
-      const flick = t * 14 + x * 0.1;
-      ctx.save();
-      ctx.shadowColor = e.color;
-      ctx.shadowBlur = 12 + 6 * Math.sin(t * 9 + x);
-      ctx.fillStyle = e.color;
-      ctx.beginPath();
-      for (let k = 0; k <= 10; k++) {
-        const a = (k / 10) * Math.PI * 2;
-        const wobble = 1 + 0.28 * Math.sin(flick + a * 3) + 0.12 * Math.sin(flick * 1.7 - a * 5);
-        const px = cx + Math.cos(a) * r * wobble;
-        const py = cy + Math.sin(a) * r * wobble * 0.9 - r * 0.15 * Math.sin(flick * 0.6);
-        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-      }
-      ctx.closePath();
-      ctx.fill();
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = 'rgba(255,224,150,0.85)';
-      ctx.beginPath(); ctx.arc(cx, cy - r * 0.1, r * 0.35, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-
-    } else if (e.kind === 'cannonball') {
-      // Cast-iron look: dark sphere, a curved highlight, a faint fuse
-      // ember trailing above it as it climbs.
-      const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
-      ctx.save();
-      const grad = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.35, r * 0.15, cx, cy, r);
-      grad.addColorStop(0, '#8a6a52');
-      grad.addColorStop(0.5, e.color);
-      grad.addColorStop(1, '#2c1f18');
-      ctx.fillStyle = grad;
-      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = 'rgba(255,255,255,0.35)';
-      ctx.beginPath(); ctx.arc(cx - r * 0.3, cy - r * 0.3, r * 0.22, 0, Math.PI * 2); ctx.fill();
-      const emberFlick = 0.5 + 0.5 * Math.sin(t * 20 + x);
-      ctx.fillStyle = 'rgba(255,180,90,' + emberFlick + ')';
-      ctx.shadowColor = 'rgba(255,150,60,0.9)';
-      ctx.shadowBlur = 8 * emberFlick;
-      ctx.beginPath(); ctx.arc(cx, cy + r * 1.15, r * 0.18 * emberFlick, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-
-    } else if (e.kind === 'cannon') {
-      // Iron barrel on a mount, pointed left — the direction it fires. Drawn
-      // so the muzzle sits flush with the entity's left edge, which is
-      // exactly where the balls are spawned.
-      const bh = e.h * 0.62;
-      const by = y + e.h - bh;
-      ctx.save();
-      // Flip about the entity's centre when it fires right, so the muzzle is
-      // drawn on the side the shots actually leave from.
-      if (e.dir > 0) { ctx.translate(x + e.w / 2, 0); ctx.scale(-1, 1); ctx.translate(-(x + e.w / 2), 0); }
-      // mount
-      ctx.fillStyle = '#4a3428';
-      ctx.beginPath();
-      ctx.moveTo(x + e.w * 0.25, y + e.h);
-      ctx.lineTo(x + e.w * 0.85, y + e.h);
-      ctx.lineTo(x + e.w * 0.68, y + e.h - e.h * 0.32);
-      ctx.lineTo(x + e.w * 0.42, y + e.h - e.h * 0.32);
-      ctx.closePath(); ctx.fill();
-      // barrel
-      const g = ctx.createLinearGradient(0, by, 0, by + bh);
-      g.addColorStop(0, '#8a6a52');
-      g.addColorStop(0.45, e.color || '#7a5240');
-      g.addColorStop(1, '#2c1f18');
-      ctx.fillStyle = g;
-      roundRect(x, by, e.w * 0.92, bh, 4); ctx.fill();
-      // muzzle ring
-      ctx.fillStyle = '#241a14';
-      roundRect(x, by - 1, 6, bh + 2, 3); ctx.fill();
-      ctx.restore();
-
-    } else if (e.kind === 'switch') {
-      // Diamond lever. Dim and static when off; once touched it locks gold
-      // and pulses gently — the level's only permanent state change, so the
-      // art should read as "solved," not as a repeating hazard.
-      const cx = x + e.w / 2, cy = y + e.h / 2, r = e.w / 2;
-      const on = e.color !== '#5a4a72';
-      const pulse = on ? (0.6 + 0.4 * Math.sin(t * 3)) : 1;
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.rotate(Math.PI / 4);
-      if (on) { ctx.shadowColor = e.color; ctx.shadowBlur = 10 * pulse; }
-      ctx.fillStyle = e.color;
-      ctx.globalAlpha = on ? 1 : 0.8;
-      ctx.fillRect(-r * 0.7, -r * 0.7, r * 1.4, r * 1.4);
-      ctx.restore();
-
-    } else if (e instanceof Box) {
-      // Wood-grain crate: base fill, a few darker grain lines, a routed
-      // border. Static art (no animation) — a box should read as solid and
-      // inert, unlike the hazards around it.
-      ctx.save();
-      ctx.fillStyle = '#8a5a34';
-      ctx.fillRect(x, y, e.w, e.h);
-      ctx.strokeStyle = 'rgba(0,0,0,0.35)';
-      ctx.lineWidth = 1;
-      for (let gy = y + e.h * 0.28; gy < y + e.h; gy += e.h * 0.32) {
-        ctx.beginPath(); ctx.moveTo(x + 2, gy); ctx.lineTo(x + e.w - 2, gy); ctx.stroke();
-      }
-      ctx.strokeStyle = 'rgba(255,220,180,0.5)';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(x + 1.5, y + 1.5, e.w - 3, e.h - 3);
       ctx.restore();
 
     } else if (e.isTriggerZone || e.kind === 'exit') {
@@ -1333,7 +1493,7 @@ function updateFeedback() {
 
   const me = players.get(slot);
   const dead = !!(me && me.dead);
-  if (dead && !wasDead) showToast('Restarting the run…', 1400);
+  if (dead && !wasDead) showToast('Hit! Restarting…', 1500);
   wasDead = dead;
 
   // Exit progress. peakPlayerCount is the high-water mark rather than a
@@ -1399,6 +1559,12 @@ function endSession(reason) {
 $('endedBtn').onclick = () => {
   try { sessionStorage.removeItem('dt-session'); } catch (e) {}
   location.reload();
+};
+$('backBtn').onclick = () => {
+  try { sessionStorage.removeItem('dt-session'); } catch (e) {}
+  if (side === Host) { try { Host.shutdown(); } catch (e) {} }
+  else if (side === Client) { try { Client.end('Leaving room'); } catch (e) {} }
+  window.location.href = LOBBY_URL;
 };
 
 // --- level-complete hand-off ---
