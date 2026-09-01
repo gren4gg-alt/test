@@ -65,8 +65,9 @@
   #stage { position:fixed; inset:0; display:none; z-index: 1; }
   #stage.on { display:block; }
   canvas#game { display:block; width:100%; height:100%; touch-action:none; background: transparent; }
-  #hud { position:fixed; top:6px; left:8px; font:11px ui-monospace, monospace;
-         color:#6a6a80; pointer-events:none; z-index:5; }
+  /* NOTE: #hud is declared once, above, at left:100px so it clears the
+     back button. A second declaration used to sit here at left:8px and
+     won by source order, putting the readout underneath the button. */
 
   #youAre { position:fixed; top:6px; left:50%; transform:translateX(-50%); z-index:5; display:none;
             align-items:center; gap:6px; font:12px system-ui, sans-serif;
@@ -794,6 +795,18 @@ class RopeSystem extends Entity {
         const inp = readInput(p);
         if (inp.right) pump += 1;
         if (inp.left)  pump -= 1;
+
+        // W (jump) climbs up, S slides down. Done HERE, on the fixed
+        // ROPE_STEP slice, rather than in pinRiders() — pinRiders runs
+        // once per rendered frame but was multiplying by this._lastDt,
+        // which is always ROPE_STEP. That made climb and slide speed
+        // track the display refresh: correct at 60fps, half speed at
+        // 120, double at 30. Sliding stops at the tail; you leave the
+        // rope with E, not by sliding off the end.
+        if (inp.jump) v.d -= CLIMB_SPEED * dt;
+        if (inp.down) v.d += SLIDE_SPEED * dt;
+        v.d = Math.max(MIN_DIST, Math.min(v.d, r.len));
+        if (ROPE_DEBUG) window.__ropeSliding = String(!!inp.down);
       }
       if (riderCount > 0) pump /= riderCount;
 
@@ -825,13 +838,10 @@ class RopeSystem extends Entity {
     for (const [p, v] of [...this.riders]) {
       const players = world.entities;
       if (players.indexOf(p) === -1 || p.dead) { this.riders.delete(p); continue; }
-      const r = v.rope, inp = readInput(p);
+      const r = v.rope;
 
-      // W (jump) climbs up, S slides down. Sliding stops at the tail —
-      // you drop off with E, not by sliding past the end.
-      if (inp.jump) v.d = Math.max(MIN_DIST, v.d - CLIMB_SPEED * this._lastDt);
-      if (ROPE_DEBUG) window.__ropeSliding = String(!!inp.down);
-      if (inp.down) v.d = v.d + SLIDE_SPEED * this._lastDt;
+      // Climb/slide now happens in stepRope(), on the fixed slice.
+      // pinRiders is purely positional plus the release edge.
       v.d = Math.max(MIN_DIST, Math.min(v.d, r.len));
 
       // E pressed again lets go, carrying the swing velocity. Ignored for
@@ -973,10 +983,17 @@ window.Level = {
       world.add(r.tip);
     }
 
-    // controller last — static build order above it is unchanged, so host
+    // Controller last — static build order above it is unchanged, so host
     // and client still agree on every static entity id.
+    //
+    // Deliberately NOT world.add()-ed. engine.js has no generic
+    // per-entity update pass (checked: _stepOnce only calls update() on
+    // isSpawner and isBouncingBall entities), so being in world.entities
+    // would never have ticked it — the world.step wrapper below is the
+    // only driver. Being in the list did, however, put it in the render
+    // list, where the shell's `e.solid === false` branch painted it as a
+    // pulsing 1px dot at the level origin.
     ropeSystem = new RopeSystem(ropeObjs);
-    world.add(ropeSystem);
 
     // Drive the rope from the world's own step, so it runs on the fixed
     // sim timestep and — crucially — AFTER the physics pass, which is
@@ -1037,19 +1054,41 @@ window.LevelDraw = function (ctx, list, t) {
   const dt = drawLast ? Math.min(0.05, (now - drawLast) / 1000) : 0;
   drawLast = now;
 
-  // --- gather tips (identified by width) and players ---
-  const tipFor = [];
+  // --- gather tips and players ---
+  //
+  // A tip is identified by `kind === 'ropetip'`, NOT by `isBouncingBall`.
+  // That distinction WAS the bug.
+  //
+  // A client never receives a real BouncingBall. netcode materializes
+  // every 'dynamic' type through the registry's makeLocal(), which for
+  // 'ball' is a bare object literal — `{ id, w, h, color, kind }`. The
+  // only other fields that reach it are the ones the registry declares in
+  // extraFields (w, h, color, kind) plus getSyncState's x/y/vx/vy. There
+  // is no `isBouncingBall` flag anywhere on it, so the old test matched
+  // nothing at all on the client.
+  //
+  // And these plain objects live in nw.dynamics, NOT in world.entities.
+  // Meanwhile Level.build() runs on the client too, so the client also
+  // holds three genuine RopeTip entities in world.entities — never
+  // simulated (nothing calls world.step() client-side) and never fed
+  // snapshot state. Those were the only things the old check ever found,
+  // which is precisely why the client saw three dead-straight ropes that
+  // hung there and never swung.
+  //
+  // So: collect both, and always prefer the wire-fed object. On the host
+  // only RopeTip instances exist, so the fallback covers that side.
+  const tipLive = [];    // snapshot-materialized (client)
+  const tipLocal = [];   // real RopeTip entities (host; stale on client)
   const players = [];
   for (let i = 0; i < list.length; i++) {
     const it = list[i], e = it.entity;
     if (!e) continue;
-    if (e.isBouncingBall) {
-      const w = e.w || 0;
-      if (w >= TIP_SIZE && w <= TIP_INDEX_MAX) {
-        const ri = w - TIP_SIZE;
-        if (ri >= 0 && ri < ROPES.length && !tipFor[ri]) {
-          tipFor[ri] = { x: it.x + w / 2, y: it.y + (e.h || w) / 2 };
-        }
+    if (e.kind === 'ropetip' || e.isBouncingBall) {
+      const w = Math.round(e.w || 0);
+      const ri = w - TIP_SIZE;
+      if (w <= TIP_INDEX_MAX && ri >= 0 && ri < ROPES.length) {
+        const into = (e instanceof RopeTip) ? tipLocal : tipLive;
+        if (!into[ri]) into[ri] = { x: it.x + w / 2, y: it.y + (e.h || w) / 2 };
       }
       continue;
     }
@@ -1057,6 +1096,8 @@ window.LevelDraw = function (ctx, list, t) {
       players.push({ e, x: it.x + e.w / 2, y: it.y + e.h / 2 });
     }
   }
+  const tipFor = [];
+  for (let ri = 0; ri < ROPES.length; ri++) tipFor[ri] = tipLive[ri] || tipLocal[ri];
   if (ROPE_DEBUG) window.__ropeTips = tipFor.filter(Boolean).length;
 
   // --- claim one rider per rope, nearest first, with hysteresis ---
