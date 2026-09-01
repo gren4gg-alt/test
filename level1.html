@@ -445,6 +445,12 @@ const RELEASE_VX_MULT = 1.15;  // multiplier on the swing velocity you keep
 // length: 3 ropes x 3 numbers, sent at ROPE_SYNC_HZ over the level message
 // channel, and integrated locally in between.
 const TIP_SIZE       = 6;      // the one synced entity per rope
+// Each tip is sized TIP_SIZE + its rope index (6, 7, 8...). `w`/`h` are
+// extraFields, so that index survives to the client and every tip can be
+// matched to its own rope exactly. Matching by nearest pivot instead is
+// what made two ropes claim the same tip and draw a V when they swung
+// close together.
+const TIP_INDEX_MAX  = 12;     // largest tip we'll treat as a rope tip
 const ROPE_SEGMENTS  = 8;      // curve smoothness, purely local — free
 const ROPE_COLOR     = '#c9a36b';
 const PLATFORM_COLOR = '#a778d6';
@@ -800,8 +806,8 @@ class RopeSystem extends Entity {
       // The tip is the only thing the client needs to see.
       if (r.tip) {
         const pt = r.pointAt(r.len);
-        r.tip.x = pt.x - TIP_SIZE / 2;
-        r.tip.y = pt.y - TIP_SIZE / 2;
+        r.tip.x = pt.x - r.tip.w / 2;
+        r.tip.y = pt.y - r.tip.h / 2;
         r.tip.vx = 0; r.tip.vy = 0;
       }
 
@@ -890,13 +896,15 @@ for (const name of ['update', 'step', 'tick', 'fixedUpdate', 'simulate', 'onTick
    unreliable and unordered, which is the wrong guarantee for something
    redrawn every frame. Snapshots are self-healing by design. ---- */
 class RopeTip extends BouncingBall {
-  constructor(x, y) {
-    super(x, y, TIP_SIZE, TIP_SIZE, {
+  constructor(x, y, ropeIndex) {
+    const size = TIP_SIZE + ropeIndex;
+    super(x, y, size, size, {
       vx: 0, vy: 0, friction: 0, minSpeed: 0,
       killsPlayers: false, bounds: null, color: ROPE_COLOR,
     });
     this.solid = false;
     this.kind = 'ropetip';
+    this.ropeIndex = ropeIndex;   // host-side only; the client reads `w`
   }
   update() { /* driven by RopeSystem */ }
 }
@@ -961,7 +969,7 @@ window.Level = {
       r.latched = false;
       r.theta = 0; r.omega = 0;
       const pt = r.pointAt(r.len);
-      r.tip = new RopeTip(pt.x - TIP_SIZE / 2, pt.y - TIP_SIZE / 2);
+      r.tip = new RopeTip(pt.x - TIP_SIZE / 2, pt.y - TIP_SIZE / 2, r.index);
       world.add(r.tip);
     }
 
@@ -996,30 +1004,30 @@ window.Level = {
 /* ---- rope line art, pinned to the interpolated coil positions so it
         looks identical on host and clients. ---- */
 window.LevelDraw = function (ctx, list, t) {
-  // Match each rope's tip by nearest pivot rather than by identity — the
-  // client's tips are makeLocal copies of the host's.
-  const tips = [];
+  // Each rope's tip identifies itself by its width: TIP_SIZE + rope index.
+  // No proximity guessing, so ropes swinging past each other can't swap or
+  // share tips.
+  const tipFor = [];
+  let found = 0;
   for (let i = 0; i < list.length; i++) {
     const it = list[i], e = it.entity;
-    if (!e) continue;
-    const isTip = e.kind === 'ropetip' ||
-                  (e.isBouncingBall && e.w <= TIP_SIZE + 2 && e.h <= TIP_SIZE + 2);
-    if (!isTip) continue;
-    tips.push({ x: it.x + (e.w || TIP_SIZE) / 2, y: it.y + (e.h || TIP_SIZE) / 2 });
+    if (!e || !e.isBouncingBall) continue;
+    const w = e.w || 0;
+    if (w < TIP_SIZE || w > TIP_INDEX_MAX) continue;
+    const ri = w - TIP_SIZE;
+    if (ri < 0 || ri >= ROPES.length || tipFor[ri]) continue;
+    tipFor[ri] = { x: it.x + w / 2, y: it.y + (e.h || w) / 2 };
+    found++;
   }
-  if (ROPE_DEBUG) window.__ropeTips = tips.length;
+  if (ROPE_DEBUG) window.__ropeTips = found;
 
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   for (let ri = 0; ri < ROPES.length; ri++) {
-    const px = ROPES[ri].x, py = CEILING_Y;
-    let tip = null, bestD = Infinity;
-    for (const c of tips) {
-      const d = Math.hypot(c.x - px, c.y - py) + Math.abs(c.x - px) * 0.5;
-      if (d < bestD) { bestD = d; tip = c; }
-    }
+    const tip = tipFor[ri];
     if (!tip) continue;
+    const px = ROPES[ri].x, py = CEILING_Y;
 
     const path = [];
     for (let k = 0; k <= ROPE_SEGMENTS; k++) {
@@ -1101,8 +1109,6 @@ window.LevelDraw = function (ctx, list, t) {
 })();
 
 } catch (__levelErr) {
-  // A crash in level code must never take the page down with it — the
-  // lobby handoff and the join flow have to survive a broken level.
   window.__ropeErr = 'level script: ' + (__levelErr && __levelErr.message || __levelErr);
   console.error('[level-rope] level script failed:', __levelErr);
 }
@@ -1135,8 +1141,6 @@ const ctx = canvas.getContext('2d');
 const setStatus = m => { bootStatus.textContent = m; };
 
 const input = new window.InputManager();
-// Exposed for level code: netcode keeps REMOTE input in its per-slot
-// records, but the local player's live buttons only ever live here.
 window.__gameInput = input;
 window.bindTouchButton($('btnLeft'),   input, 'left');
 window.bindTouchButton($('btnRight'),  input, 'right');
@@ -1403,7 +1407,7 @@ function draw() {
     if (e.isCameraWall) continue;
     // rope tips are invisible carriers; LevelDraw draws the rope itself
     if (e.kind === 'ropetip') continue;
-    if (e.isBouncingBall && e.w <= 8 && e.h <= 8) continue;
+    if (e.isBouncingBall && e.w <= 12 && e.h <= 12) continue;
     const x = it.x, y = it.y;
 
     if (e instanceof Player) {
