@@ -378,14 +378,22 @@ const LEDGE_W     = 180;   // width of the start ledge
 const PIT_DEATH_PAD = 80;  // deathY = H_ + this
 
 // ---- ropes ----
-// x         : where the rope hangs from (its pivot)
-// restLen   : length it hangs at before anyone has touched it
-// fullLen   : length it grows to once first grabbed (set === restLen for no growth)
-// One entry per rope, left to right. Add/remove entries freely.
+// One entry per rope, left to right. Add or remove entries freely.
+// x           : where the rope hangs from (its pivot)
+// restLen     : length with nobody on it
+// growPerRider: extra length for each player currently hanging on it, so
+//               the rope pays itself out as the team climbs on and pulls
+//               back up as they leave
+// maxLen      : hard ceiling on restLen + growth
 const ROPES = [
-  { x: 300, restLen: 340, fullLen: 340 },   // Rope A — the "just barely" one
-  { x: 700, restLen: 380, fullLen: 380 },   // Rope B
-  { x: 1130, restLen: 360, fullLen: 360 },   // Rope C
+  // Rope A — the "just barely" one. Short enough that a lone player can't
+  // reach it: two must stack, the top one catches the tail, and the rope
+  // then pays out far enough for the next player to reach from the ledge.
+  // Every extra rider lowers it again, so a 4-player team ends up with a
+  // much longer rope than a 2-player one.
+  { x: 300,  restLen: 340, growPerRider: 60, maxLen: 520 },
+  { x: 700,  restLen: 380 },
+  { x: 1130, restLen: 360 },
 ];
 
 // Each rope hangs from its own small anchor block instead of a
@@ -411,7 +419,6 @@ const EXPAND_SPEED    = 100;   // px/s the rope lengthens after first grab
 const GRAB_RADIUS     = 23;    // px from the rope line that counts as a catch
                                // (ACTION must be held to actually grab)
 const REGRAB_COOLDOWN = 0.30;  // s after letting go before you can catch again
-const RELEASE_BOOST   = 280;   // s after letting go before you can catch again
 // A remote player's buttons arrive over the network, so a single dropped
 // packet reads as "released" for one tick. Without debouncing, that false
 // release registers as a fresh press the moment the next packet lands —
@@ -419,9 +426,10 @@ const RELEASE_BOOST   = 280;   // s after letting go before you can catch again
 // read as up for this long before we believe it.
 const ACTION_DEBOUNCE = 0.12;  // s
 const MIN_HANG_TIME   = 0.25;  // s on the rope before E can release you
+const RELEASE_BOOST   = 280;   // upward kick on release — E is a real jump
                                // off the rope, not just a let-go. Lower it
                                // toward 0 for a pure swing-momentum launch.
-const RELEASE_VX_MULT = 0.4;  // multiplier on the swing velocity you keep
+const RELEASE_VX_MULT = 1.15;  // multiplier on the swing velocity you keep
 
 // ---- cosmetics ----
 // Ropes are no longer made of synced entities. Syncing 7 coils x 3 ropes
@@ -606,9 +614,10 @@ class Rope {
   constructor(def, index) {
     this.px = def.x;
     this.py = CEILING_Y;
+    this.restLen = def.restLen;
+    this.growPerRider = def.growPerRider || 0;
+    this.maxLen = def.maxLen || def.restLen;
     this.len = def.restLen;
-    this.fullLen = def.fullLen;
-    this.grown = def.fullLen <= def.restLen;
     this.theta = 0;      // radians from vertical, + = right
     this.omega = 0;
     this.index = index;
@@ -736,18 +745,20 @@ class RopeSystem extends Entity {
 
     // ---- swing each rope ----
     for (const r of this.ropes) {
-      // grow to full length once someone is on it
-      if (!r.grown) {
-        const anyRider = [...this.riders.values()].some(v => v.rope === r);
-        if (anyRider) {
-          const before = r.len;
-          r.len = Math.min(r.fullLen, r.len + EXPAND_SPEED * dt);
-          if (r.len >= r.fullLen) r.grown = true;
-          // riders hanging near the tail ride down with it
-          const scale = r.len / before;
-          for (const [p, v] of this.riders) {
-            if (v.rope === r) v.d = Math.min(r.len, v.d * scale);
-          }
+      // Length tracks how many players are hanging on it. Riders slide
+      // down with the rope as it pays out (and are carried up as it
+      // retracts) so nobody's grip position jumps.
+      let onThisRope = 0;
+      for (const v of this.riders.values()) if (v.rope === r) onThisRope++;
+      const target = Math.min(r.maxLen, r.restLen + r.growPerRider * onThisRope);
+      if (Math.abs(target - r.len) > 0.5) {
+        const before = r.len;
+        const dir = target > r.len ? 1 : -1;
+        r.len += dir * EXPAND_SPEED * dt;
+        if ((dir > 0 && r.len > target) || (dir < 0 && r.len < target)) r.len = target;
+        const scale = r.len / before;
+        for (const v of this.riders.values()) {
+          if (v.rope === r) v.d = Math.max(MIN_DIST, Math.min(r.len, v.d * scale));
         }
       }
 
@@ -849,25 +860,36 @@ const clientRopes = ROPES.map(d => ({ theta: 0, omega: 0, len: d.restLen }));
 let clientLastFrame = 0;
 
 (function wireRopeSync() {
-  const N = window.Netcode;
-  if (!N || !N.Client) return;
-  const prev = typeof N.Client.onLevelMsg === 'function'
-    ? N.Client.onLevelMsg.bind(N.Client) : null;
-  N.Client.onLevelMsg = function (payload) {
-    try {
-      if (payload && payload.t === 'rope' && Array.isArray(payload.a)) {
-        for (let i = 0; i < payload.a.length && i < clientRopes.length; i++) {
-          const [th, om, len] = payload.a[i];
-          const c = clientRopes[i];
-          c.theta += (th - c.theta) * ROPE_BLEND;
-          c.omega += (om - c.omega) * ROPE_BLEND;
-          c.len = len;
+  // The shell assigns Client.onLevelMsg during boot, which can land after
+  // this script runs and quietly replace our handler — that's why the
+  // client never saw a rope message. So we install, then keep checking
+  // that we're still installed, chaining to whatever else was set.
+  let ours = null;
+  function install() {
+    const N = window.Netcode;
+    if (!N || !N.Client) return;
+    if (N.Client.onLevelMsg === ours) return;
+    const prev = typeof N.Client.onLevelMsg === 'function'
+      ? N.Client.onLevelMsg.bind(N.Client) : null;
+    ours = function (payload) {
+      try {
+        if (payload && payload.t === 'rope' && Array.isArray(payload.a)) {
+          for (let i = 0; i < payload.a.length && i < clientRopes.length; i++) {
+            const m = payload.a[i];
+            const c = clientRopes[i];
+            c.theta += (m[0] - c.theta) * ROPE_BLEND;
+            c.omega += (m[1] - c.omega) * ROPE_BLEND;
+            c.len = m[2];
+          }
+          window.__ropeSync = (window.__ropeSync || 0) + 1;
         }
-        window.__ropeSync = (window.__ropeSync || 0) + 1;
-      }
-    } catch (e) {}
-    if (prev) return prev(payload);
-  };
+      } catch (e) {}
+      if (prev) return prev(payload);
+    };
+    N.Client.onLevelMsg = ours;
+  }
+  install();
+  setInterval(install, 1000);
 })();
 
 function advanceClientRopes(dt) {
@@ -936,7 +958,6 @@ window.Level = {
     // `len`, which the host broadcasts a few times a second.
     for (const r of ropeObjs) {
       r.len = ROPES[r.index].restLen;
-      r.grown = ROPES[r.index].fullLen <= ROPES[r.index].restLen;
       r.theta = 0; r.omega = 0;
     }
 
@@ -1342,7 +1363,6 @@ function draw() {
 
   const list = side.renderList();
 
-  // Level-owned art, drawn inside the world transform and behind entities.
   if (typeof window.LevelDraw === 'function') {
     try { window.LevelDraw(ctx, list, t); }
     catch (err) { console.warn('LevelDraw threw:', err); }
