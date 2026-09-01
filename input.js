@@ -4,7 +4,7 @@
    Combines keyboard and touch (or any future source — gamepad, a second
    local player's controls, etc.) into one plain state object:
 
-       { left: bool, right: bool, jump: bool, action: bool }
+       { left: bool, right: bool, jump: bool, action: bool, down: bool }
 
    Game code only ever reads InputManager#getState() and never touches
    keyboard/touch APIs directly. That's the whole point: swapping or adding
@@ -16,6 +16,7 @@
      bindTouchButton(document.getElementById('btnLeft'), input, 'left');
      bindTouchButton(document.getElementById('btnRight'), input, 'right');
      bindTouchButton(document.getElementById('btnJump'), input, 'jump');
+     bindTouchButton(document.getElementById('btnDown'), input, 'down');
      ...
      player.handleInput(input.getState(), dt);
 
@@ -32,9 +33,11 @@ class InputManager {
     // ORs them together so e.g. keyboard-left and touch-left both work,
     // including simultaneously (handy for testing touch UI with a mouse
     // while a keyboard is also attached).
+    // `down` is not consumed by player physics — it exists for level code
+    // (rope sliding, drop-through, crouch) and rides the DOWN wire bit.
     this._sources = {
-      keyboard: { left: false, right: false, jump: false, action: false },
-      touch:    { left: false, right: false, jump: false, action: false },
+      keyboard: { left: false, right: false, jump: false, action: false, down: false },
+      touch:    { left: false, right: false, jump: false, action: false, down: false },
     };
     this._bindKeyboard();
   }
@@ -47,10 +50,14 @@ class InputManager {
       kb.right  = held.has('ArrowRight') || held.has('KeyD');
       kb.jump   = held.has('ArrowUp')    || held.has('KeyW') || held.has('Space');
       kb.action = held.has('KeyE')       || held.has('KeyF');
+      kb.down   = held.has('ArrowDown')  || held.has('KeyS');
     };
     window.addEventListener('keydown', (e) => {
       held.add(e.code);
-      if (e.code === 'Space') e.preventDefault(); // stop the page from scrolling
+      // stop the page from scrolling on space and the arrow keys
+      if (e.code === 'Space' || e.code === 'ArrowDown' || e.code === 'ArrowUp') {
+        e.preventDefault();
+      }
       sync();
     });
     window.addEventListener('keyup', (e) => {
@@ -64,19 +71,20 @@ class InputManager {
 
   /** Touch (or any other custom source) calls this to report state. */
   setSource(sourceName, key, pressed) {
-    if (!this._sources[sourceName]) this._sources[sourceName] = { left: false, right: false, jump: false, action: false };
+    if (!this._sources[sourceName]) this._sources[sourceName] = { left: false, right: false, jump: false, action: false, down: false };
     this._sources[sourceName][key] = pressed;
   }
 
-  /** Returns the merged {left, right, jump, action} state for this frame. */
+  /** Returns the merged {left, right, jump, action, down} state for this frame. */
   getState() {
-    const out = { left: false, right: false, jump: false, action: false };
+    const out = { left: false, right: false, jump: false, action: false, down: false };
     for (const name in this._sources) {
       const s = this._sources[name];
       out.left   = out.left   || s.left;
       out.right  = out.right  || s.right;
       out.jump   = out.jump   || s.jump;
       out.action = out.action || s.action;
+      out.down   = out.down   || s.down;
     }
     return out;
   }
