@@ -383,9 +383,9 @@ const PIT_DEATH_PAD = 80;  // deathY = H_ + this
 // fullLen   : length it grows to once first grabbed (set === restLen for no growth)
 // One entry per rope, left to right. Add/remove entries freely.
 const ROPES = [
-  { x: 300, restLen: 340, fullLen: 340 },   // Rope A — the "just barely" one
-  { x: 700, restLen: 380, fullLen: 380 },   // Rope B
-  { x: 1140, restLen: 360, fullLen: 360 },   // Rope C
+  { x: 300, restLen: 250, fullLen: 400 },   // Rope A — the "just barely" one
+  { x: 570, restLen: 380, fullLen: 380 },   // Rope B
+  { x: 840, restLen: 360, fullLen: 360 },   // Rope C
 ];
 
 // Each rope hangs from its own small anchor block instead of a
@@ -396,25 +396,32 @@ const ANCHOR_W     = 40;
 const ANCHOR_H     = 14;
 const ANCHOR_SOLID = true;      // false = decorative only, can't stand on it
 
-const EXIT_GAP     = 390;  // horizontal gap from the last rope to the exit platform
+const EXIT_GAP     = 190;  // horizontal gap from the last rope to the exit platform
 const EXIT_PLAT_W  = 190;
 const EXIT_PLAT_Y  = 430;  // top surface of the exit platform
 
 // ---- rope feel ----
 const ROPE_DAMPING    = 0.55;  // 1/s. higher = swing dies faster
-const PUMP_ACCEL      = 0.8;   // rad/s^2 added by left/right while hanging
-const MAX_OMEGA       = 3;   // rad/s angular speed cap
+const PUMP_ACCEL      = 3.6;   // rad/s^2 added by left/right while hanging
+const MAX_OMEGA       = 3.2;   // rad/s angular speed cap
 const CLIMB_SPEED     = 130;   // px/s up the rope while JUMP (W) is held
 const SLIDE_SPEED     = 190;   // px/s down the rope while DOWN (S) is held
 const MIN_DIST        = 34;    // closest you can climb to the pivot
-const EXPAND_SPEED    = 100;   // px/s the rope lengthens after first grab
-const GRAB_RADIUS     = 18;    // px from the rope line that counts as a catch
+const EXPAND_SPEED    = 260;   // px/s the rope lengthens after first grab
+const GRAB_RADIUS     = 34;    // px from the rope line that counts as a catch
                                // (ACTION must be held to actually grab)
 const REGRAB_COOLDOWN = 0.30;  // s after letting go before you can catch again
-const RELEASE_BOOST   = 230;   // upward kick on release — E is a real jump
+// A remote player's buttons arrive over the network, so a single dropped
+// packet reads as "released" for one tick. Without debouncing, that false
+// release registers as a fresh press the moment the next packet lands —
+// which is exactly a grab followed instantly by a let-go. ACTION must
+// read as up for this long before we believe it.
+const ACTION_DEBOUNCE = 0.12;  // s
+const MIN_HANG_TIME   = 0.25;  // s on the rope before E can release you
+const RELEASE_BOOST   = 430;   // upward kick on release — E is a real jump
                                // off the rope, not just a let-go. Lower it
                                // toward 0 for a pure swing-momentum launch.
-const RELEASE_VX_MULT = 0.4;  // multiplier on the swing velocity you keep
+const RELEASE_VX_MULT = 1.15;  // multiplier on the swing velocity you keep
 
 // ---- cosmetics ----
 const NODES_PER_ROPE = 7;      // coil dots drawn along each rope
@@ -638,7 +645,8 @@ class RopeSystem extends Entity {
     this.ropes = ropes;
     this.riders = new Map();   // Player -> { rope, d }
     this.cooldown = new Map(); // Player -> seconds left
-    this.prevAction = new Map(); // Player -> was E down last tick (edge detect)
+    this.act = new Map();      // Player -> {down, upFor, rising} debounced E
+    this.hangTime = new Map(); // Player -> s spent on the current rope
     this.lastGen = -1;
     this.lastDriven = 0;
   }
@@ -677,13 +685,34 @@ class RopeSystem extends Entity {
       this.lastGen = world.resetGeneration;
       this.riders.clear();
       this.cooldown.clear();
-      this.prevAction.clear();
+      this.act.clear();
+      this.hangTime.clear();
       for (const r of this.ropes) { r.theta = 0; r.omega = 0; }
     }
 
     refreshInputs();
 
     const players = world.entities.filter(e => e instanceof Player && !e.dead);
+
+    // ---- debounced ACTION edges, computed once per tick for everyone ----
+    // A brief gap in the input stream no longer counts as a release, so a
+    // press can't be double-read as grab-then-release.
+    for (const p of players) {
+      const raw = readInput(p).action;
+      let a = this.act.get(p);
+      if (!a) { a = { down: false, upFor: 99, rising: false }; this.act.set(p, a); }
+      a.rising = false;
+      if (raw) {
+        a.upFor = 0;
+        if (!a.down) { a.down = true; a.rising = true; }
+      } else {
+        a.upFor += dt;
+        if (a.upFor >= ACTION_DEBOUNCE) a.down = false;
+      }
+    }
+    for (const [p, v] of this.riders) {
+      this.hangTime.set(p, (this.hangTime.get(p) || 0) + dt);
+    }
     if (ROPE_DEBUG) {
       window.__ropeAction = players.filter(p => readInput(p).action).length + '/' + players.length;
       window.__ropeRiders = this.riders.size;
@@ -698,13 +727,12 @@ class RopeSystem extends Entity {
     for (const p of players) {
       if (this.riders.has(p) || this.cooldown.has(p)) continue;
       // CONTROLS: ACTION (E) = grab, and press it again to let go.
-      //           JUMP   (W) = climb up while hanging.
-      // Grabbing is on the rising edge of E, not "held", so the press
-      // that grabs can't also be read as the press that releases.
-      const ip = readInput(p);
-      const wasDown = this.prevAction.get(p);
-      this.prevAction.set(p, ip.action);
-      if (!ip.action || wasDown) continue;
+      //           JUMP   (W) = climb up, DOWN (S) = slide down.
+      // Grab fires on a debounced rising edge, so the press that grabs
+      // can never also be read as the press that releases.
+      const a = this.act.get(p);
+      if (!a || !a.rising) continue;
+      a.rising = false;              // consumed by the grab
       const cx = p.x + p.w / 2, cy = p.y + p.h / 2;
       let best = null, bestDist = GRAB_RADIUS;
       for (const r of this.ropes) {
@@ -779,10 +807,14 @@ class RopeSystem extends Entity {
       if (inp.down) v.d = v.d + SLIDE_SPEED * this._lastDt;
       v.d = Math.max(MIN_DIST, Math.min(v.d, r.len));
 
-      // E (action) pressed again lets go, carrying the swing velocity
-      const wasDown = this.prevAction.get(p);
-      this.prevAction.set(p, inp.action);
-      if (inp.action && !wasDown) { this.release(p, v); continue; }
+      // E pressed again lets go, carrying the swing velocity. Ignored for
+      // the first MIN_HANG_TIME so a laggy grab can't bounce straight off.
+      const a = this.act.get(p);
+      if (a && a.rising && (this.hangTime.get(p) || 0) >= MIN_HANG_TIME) {
+        a.rising = false;
+        this.release(p, v);
+        continue;
+      }
 
       const pt = r.pointAt(v.d);
       p.vx = 0; p.vy = 0;
@@ -802,6 +834,7 @@ class RopeSystem extends Entity {
     const w = tang / dd;
     rope.omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, rope.omega + w * 0.6));
     this.riders.set(p, { rope, d: dd });
+    this.hangTime.set(p, 0);
     p.vx = 0; p.vy = 0;
   }
 
@@ -811,6 +844,7 @@ class RopeSystem extends Entity {
     const vy = -r.omega * v.d * Math.sin(r.theta) - RELEASE_BOOST;
     p.vx = vx; p.vy = vy;
     this.riders.delete(p);
+    this.hangTime.delete(p);
     this.cooldown.set(p, REGRAB_COOLDOWN);
   }
 }
