@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Duble Trouble — Arrow Gap</title>
+<title>Duble Trouble — Rope Line</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -203,6 +203,7 @@
   <div class="pad">
     <div class="tbtn" id="btnLeft">&#9664;</div>
     <div class="tbtn" id="btnRight">&#9654;</div>
+    <div class="tbtn" id="btnDown">&#9660;</div>
   </div>
   <div class="pad">
     <div class="tbtn" id="btnAction">&#9995;</div>
@@ -356,205 +357,755 @@
 })();
 </script>
 <!-- ==========================================================================
-     Level: Arrow Gap — inlined here in place of level.js.
-     Tunables: ARROW_COUNT, ARROW_GAP, ARROW_SPEED, JUMP_GAP.
+     Level: Rope Line — inlined here in place of level.js.
+     Everything tunable lives in the SETTINGS block at the top.
      ========================================================================== -->
 <script>
 (function () {
 "use strict";
+try {
 
-const { StaticBody, Entity, TriggerZone, ProjectileSpawner } = window.Engine;
+const { StaticBody, Entity, TriggerZone, BouncingBall, Player, PHYSICS } = window.Engine;
 
-const ARROW_COUNT = 12;
-const ARROW_GAP    = 70;
-const ARROW_SPEED  = 70;
-const JUMP_GAP      = 30;
+/* =======================================================================
+   SETTINGS — tune these, everything below is derived.
+   ======================================================================= */
 
-// 'follow' — camera tracks the players (engine.js's Camera, already
-// simulated and synced; this just renders through it). 'whole' — the
-// old behaviour, the entire level letterboxed to fit the window.
+// ---- world frame ----
+const H_          = 620;   // level height
+const CEILING_Y   = 60;    // y the ropes hang from
+const LEDGE_Y     = 470;   // top surface of the start ledge
+const LEDGE_W     = 180;   // width of the start ledge
+const PIT_DEATH_PAD = 80;  // deathY = H_ + this
+
+// ---- ropes ----
+// One entry per rope, left to right. Add or remove entries freely.
+// restLen      : length with nobody on it, for a 2-player team
+// shrinkPerHead: how much SHORTER it starts for each player beyond the
+//                second — a bigger team has to build a taller stack
+// growPerRider : extra length per player currently hanging on it
+// maxLen       : hard ceiling
+// minLen       : floor, so a big team can't shrink it out of reach entirely
+//
+// Once every player is on the rope at the same time the length LATCHES:
+// from then on it only ever grows, never retracts, so the last player up
+// can't be stranded by someone else letting go.
+const ROPES = [
+  // Rope A — the "just barely" one. Short enough that a lone player can't
+  // reach it: two must stack, the top one catches the tail, and the rope
+  // then pays out far enough for the next player to reach from the ledge.
+  // Every extra rider lowers it again, so a 4-player team ends up with a
+  // much longer rope than a 2-player one.
+  { x: 300,  restLen: 340, shrinkPerHead: 45, growPerRider: 60,
+             maxLen: 520, minLen: 200 },
+  { x: 700,  restLen: 380 },
+  { x: 1130, restLen: 360 },
+];
+
+// Each rope hangs from its own small anchor block instead of a
+// full-width ceiling beam. Set ANCHOR_STYLE to 'none' to have the ropes
+// hang from nothing at all (pure mid-air).
+const ANCHOR_STYLE = 'block';   // 'block' | 'none'
+const ANCHOR_W     = 40;
+const ANCHOR_H     = 14;
+const ANCHOR_SOLID = true;      // false = decorative only, can't stand on it
+
+const EXIT_GAP     = 390;  // horizontal gap from the last rope to the exit platform
+const EXIT_PLAT_W  = 190;
+const EXIT_PLAT_Y  = 430;  // top surface of the exit platform
+
+// ---- rope feel ----
+const ROPE_DAMPING    = 0.55;  // 1/s. higher = swing dies faster
+const PUMP_ACCEL      = 0.8;   // rad/s^2 added by left/right while hanging
+const MAX_OMEGA       = 3;   // rad/s angular speed cap
+const CLIMB_SPEED     = 130;   // px/s up the rope while JUMP (W) is held
+const SLIDE_SPEED     = 190;   // px/s down the rope while DOWN (S) is held
+const MIN_DIST        = 34;    // closest you can climb to the pivot
+const EXPAND_SPEED    = 100;   // px/s the rope lengthens after first grab
+const GRAB_RADIUS     = 23;    // px from the rope line that counts as a catch
+                               // (ACTION must be held to actually grab)
+const REGRAB_COOLDOWN = 0.30;  // s after letting go before you can catch again
+// A remote player's buttons arrive over the network, so a single dropped
+// packet reads as "released" for one tick. Without debouncing, that false
+// release registers as a fresh press the moment the next packet lands —
+// which is exactly a grab followed instantly by a let-go. ACTION must
+// read as up for this long before we believe it.
+const ACTION_DEBOUNCE = 0.12;  // s
+const MIN_HANG_TIME   = 0.25;  // s on the rope before E can release you
+const RELEASE_BOOST   = 280;   // upward kick on release — E is a real jump
+                               // off the rope, not just a let-go. Lower it
+                               // toward 0 for a pure swing-momentum launch.
+const RELEASE_VX_MULT = 1.15;  // multiplier on the swing velocity you keep
+
+// ---- cosmetics ----
+// Ropes are no longer made of synced entities. Syncing 7 coils x 3 ropes
+// meant 21 extra dynamic entities in every snapshot at SNAPSHOT_HZ, purely
+// so the client could draw a line — which is what was choking phones.
+// A rope is a straight segment, so the client only needs its angle and
+// length: 3 ropes x 3 numbers, sent at ROPE_SYNC_HZ over the level message
+// channel, and integrated locally in between.
+const TIP_SIZE       = 6;      // the one synced entity per rope
+const ROPE_SEGMENTS  = 8;      // curve smoothness, purely local — free
+const ROPE_COLOR     = '#c9a36b';
+const PLATFORM_COLOR = '#a778d6';
+const GOAL_COLOR     = '#f0c419';
+
 const VIEW_MODE = 'follow';
 
-// Derived from engine.js's PHYSICS, not guessed: JUMP_VELOCITY 560 against
-// GRAVITY 1700 gives ~0.66s of airtime, and MOVE_SPEED 260 carries you
-// ~171px in that time. That's the absolute theoretical maximum from a
-// perfect full-speed running jump, so gaps are held to ~75% of it to stay
-// humanly clearable. Any gap wider than 171 is literally impossible and
-// the level becomes unfinishable — which is exactly what the original
-// 230px chasm was.
-const MAX_JUMP = Math.round((2 * 560 / 1700) * 260);   // 171
-const SAFE_JUMP = Math.round(MAX_JUMP * 0.75);          // 128
+// On-screen readout of input source, tick driver, rope tip count etc.
+// Flip to true if the rope ever misbehaves — it isolates input vs sim vs
+// render in one glance.
+const ROPE_DEBUG = false;
 
-const H_ = 540;
-const FLOOR_Y = 440;
-const START_W = 170;
-const GAP_MARGIN = 40;
-const chasmStartX = START_W;
-const arrowsSpanW = (ARROW_COUNT - 1) * ARROW_GAP;
-const chasmEndX = chasmStartX + GAP_MARGIN * 2 + arrowsSpanW;
-const chasmW = chasmEndX - chasmStartX;
+// Fixed integration slice for the pendulum, independent of framerate.
+const ROPE_STEP = 1 / 60;
 
-// Stepping stones across the chasm, spaced so no single jump exceeds
-// SAFE_JUMP. Count scales with the chasm, so changing ARROW_COUNT or
-// ARROW_GAP can never silently produce an uncrossable gap again.
-const STONE_W = 54;
-const stoneCount = Math.max(0, Math.ceil((chasmW - SAFE_JUMP) / (SAFE_JUMP + STONE_W)));
-// Gap is what must stay jumpable, so solve for it directly: n stones and
-// n+1 equal gaps span the chasm. (Distributing stone CENTRES evenly
-// instead makes the two end gaps a stone-width wider than the inner
-// ones — at 12 arrows that pushed them to 159px, right on the edge of
-// the 171px absolute maximum.)
-const stoneGap = stoneCount > 0 ? (chasmW - stoneCount * STONE_W) / (stoneCount + 1) : 0;
-const stoneXs = [];
-for (let i = 0; i < stoneCount; i++) {
-  stoneXs.push(chasmStartX + stoneGap * (i + 1) + STONE_W * i);
+/* =======================================================================
+   derived layout
+   ======================================================================= */
+const lastRope = ROPES[ROPES.length - 1];
+const EXIT_X   = lastRope.x + EXIT_GAP;
+const LEVEL_W  = EXIT_X + EXIT_PLAT_W + 60;
+
+/* =======================================================================
+   ASSUMPTIONS (flagged — these are the only lines likely to need a fix)
+
+   1. Entity.update(dt) is called once per sub-step by World. If your
+      engine passes (dt, world) that's fine — we ignore extra args and use
+      a captured `theWorld` instead.                    -> RopeSystem.update
+   2. Player exposes its held buttons. We read them defensively through
+      readInput() below, which tries .input / .btn / .inputMask. If none
+      match, ropes still swing but pumping/climbing won't respond.
+                                                        -> readInput()
+   3. BouncingBall instances are picked up for sync by
+      world.entities.filter(e => e.isBouncingBall) — so rope coils sync
+      for free without a TYPE_REGISTRY change, and must NOT go in any nw
+      array.                                            -> RopeNode
+   4. Entity updates only run on the host (clients interpolate
+      snapshots), so all rope logic is host-authoritative by default.
+   ======================================================================= */
+
+let theWorld = null;
+let ropeSystem = null;
+
+// --- input plumbing -----------------------------------------------------
+// The Player entity itself carries no button state (confirmed: the
+// resolver found nothing on it). netcode's Host keeps input in its own
+// per-slot records, so we look there instead, and fall back to the local
+// InputManager for the host's own player.
+//
+// Nothing here assumes a field name. Each tick we walk Host.nw.players,
+// find the Player entity inside each record, and find the button state
+// inside the same record — either an object of booleans or a numeric
+// bitmask (netcode BTN: LEFT 1, RIGHT 2, JUMP 4, ACTION 8).
+const NO_INPUT = { left: false, right: false, jump: false, action: false, down: false };
+let inputMap = new Map();   // Player -> {left,right,jump,action}
+
+function looksLikeButtons(o) {
+  return o && typeof o === 'object' &&
+         ('action' in o || 'jump' in o) && ('left' in o || 'right' in o);
+}
+function fromMask(m) {
+  return { left: !!(m & 1), right: !!(m & 2), jump: !!(m & 4),
+           action: !!(m & 8), down: !!(m & 16) };
+}
+function findButtons(rec, depth) {
+  if (!rec || typeof rec !== 'object' || depth > 2) return null;
+  if (looksLikeButtons(rec)) return { v: rec, how: 'obj' };
+  for (const k in rec) {
+    const val = rec[k];
+    if (looksLikeButtons(val)) return { v: val, how: 'obj:' + k };
+  }
+  for (const k in rec) {
+    if (typeof rec[k] === 'number' && /mask|bits|btn|input/i.test(k)) {
+      return { v: fromMask(rec[k]), how: 'mask:' + k };
+    }
+  }
+  return null;
+}
+function findPlayer(rec) {
+  if (rec instanceof Player) return rec;
+  if (!rec || typeof rec !== 'object') return null;
+  for (const k of ['player', 'entity', 'p', 'ent', 'body']) {
+    if (rec[k] instanceof Player) return rec[k];
+  }
+  for (const k in rec) if (rec[k] instanceof Player) return rec[k];
+  return null;
 }
 
-const safeSpaceW = 630;
-const stepW = 80;
-// The second step is deliberately wider than the first: it carries the
-// death orb, and a player who has learned that needs somewhere on the
-// platform to stand that ISN'T under the orb. At the old 80px the
-// platform was barely wider than the player, so there was no "avoid it"
-// option — only "don't come here", which makes the step useless.
-const step2W = 190;
-const step1X = chasmEndX + safeSpaceW + JUMP_GAP;
-const step2X = step1X + stepW + JUMP_GAP;
-const exitX = step2X + step2W + JUMP_GAP;
+// The local player's own buttons never go through the network, so grab
+// them straight off whichever input singleton the page exposes.
+function localButtons() {
+  const cands = [window.__gameInput, window.Input, window.input,
+                 window.Game && window.Game.input];
+  for (const c of cands) {
+    if (looksLikeButtons(c)) return { v: c, how: 'local' };
+    if (c && looksLikeButtons(c.state)) return { v: c.state, how: 'local.state' };
+    for (const k of ['state', 'buttons', 'btn', 'held', 'current']) {
+      if (c && looksLikeButtons(c[k])) return { v: c[k], how: 'local.' + k };
+    }
+    if (c && typeof c.getState === 'function') {
+      try { const st = c.getState(); if (looksLikeButtons(st)) return { v: st, how: 'local.getState' }; }
+      catch (e) {}
+    }
+  }
+  return null;
+}
 
-// ---- Orbs -------------------------------------------------------------
-// Two floating lights above the steps. The first is pure decoration; the
-// second kills on contact. Same size and same bob so they read as a pair
-// and the lethal one has to be learned.
-const ORB_R = 7;                 // radius, px
-const ORB_HOVER = 26;            // height above the platform surface
-// Where along the second step the death orb sits, 0..1 across its width.
-// Kept off-centre so the safe standing room is one contiguous strip
-// rather than two thin slivers either side.
-const DEATH_ORB_T = 0.34;
-const exitPedestalW = 110;
-const LEVEL_W = exitX + exitPedestalW + 40;
+function refreshInputs() {
+  inputMap = new Map();
+  let how = null;
+  const H = window.Netcode && window.Netcode.Host;
+  const recs = H && H.nw && H.nw.players;
+  if (recs && typeof recs.forEach === 'function') {
+    recs.forEach((rec, slot) => {
+      const p = findPlayer(rec);
+      const b = findButtons(rec, 0);
+      if (p && b) { inputMap.set(p, b.v); how = how || ('host:' + b.how); }
+    });
+  }
+  // host's own player: prefer the live local input if the record didn't
+  // carry it (some netcode builds apply local input without storing it).
+  const loc = localButtons();
+  if (loc && H && typeof H.mySlot !== 'undefined' && recs) {
+    const rec = recs.get ? recs.get(H.mySlot) : null;
+    const p = findPlayer(rec);
+    if (p) {
+      // The host's own buttons are read straight off the InputManager and
+      // OR'd over whatever the slot record held. If netcode's mask is
+      // stale or missing a bit for the local player, this still works;
+      // remote players rely on the mask alone.
+      const rec_v = inputMap.get(p);
+      inputMap.set(p, rec_v ? {
+        left:   rec_v.left   || !!loc.v.left,
+        right:  rec_v.right  || !!loc.v.right,
+        jump:   rec_v.jump   || !!loc.v.jump,
+        action: rec_v.action || !!loc.v.action,
+        down:   rec_v.down   || !!loc.v.down,
+      } : loc.v);
+      how = how || loc.how;
+    }
+  }
+  window.__ropeInput = how || (loc ? loc.how + ' (unmapped)' : 'NOT FOUND');
+  if (ROPE_DEBUG) {
+    // raw mask of every mapped player, so a missing DOWN bit (16) is
+    // visible as a number rather than guessed at
+    const masks = [];
+    if (recs && typeof recs.forEach === 'function') {
+      recs.forEach((rec) => {
+        const p = findPlayer(rec);
+        if (!p) return;
+        const m = (typeof p._mask === 'number') ? p._mask
+                : (typeof rec._mask === 'number') ? rec._mask : null;
+        masks.push(m === null ? '?' : m);
+      });
+    }
+    window.__ropeMask = masks.join(',') || '-';
+    window.__ropeLocDown = loc ? String(!!loc.v.down) : '-';
+  }
+  window.__ropeLoc = loc ? loc.how : '-';
+}
 
-const PLATFORM_COLOR = '#a778d6';
-const GOAL_COLOR = '#f0c419';
+// DOWN is a real wire bit now (BTN.DOWN = 16), so `inp.down` works for
+// local and remote players alike and there is no relay to maintain.
+function readInput(p) {
+  const v = inputMap.get(p);
+  if (!v) return NO_INPUT;
+  return { left: !!v.left, right: !!v.right, jump: !!v.jump,
+           action: !!v.action, down: !!v.down };
+}
+
+/* ---- one rope: pivot, angle, riders ---- */
+class Rope {
+  constructor(def, index) {
+    this.px = def.x;
+    this.py = CEILING_Y;
+    this.restLen = def.restLen;
+    this.shrinkPerHead = def.shrinkPerHead || 0;
+    this.growPerRider = def.growPerRider || 0;
+    this.maxLen = def.maxLen || def.restLen;
+    this.minLen = def.minLen || 120;
+    this.latched = false;   // true once everyone has been on at once
+    this.len = def.restLen;
+    this.theta = 0;      // radians from vertical, + = right
+    this.omega = 0;
+    this.index = index;
+  }
+  tipX() { return this.px + Math.sin(this.theta) * this.len; }
+  tipY() { return this.py + Math.cos(this.theta) * this.len; }
+  pointAt(d) {
+    return { x: this.px + Math.sin(this.theta) * d,
+             y: this.py + Math.cos(this.theta) * d };
+  }
+  // shortest distance from a point to the rope line, plus how far down it is
+  project(x, y) {
+    const dx = x - this.px, dy = y - this.py;
+    let d = dx * Math.sin(this.theta) + dy * Math.cos(this.theta);
+    d = Math.max(0, Math.min(this.len, d));
+    const p = this.pointAt(d);
+    return { d, dist: Math.hypot(x - p.x, y - p.y) };
+  }
+}
+
+/* ---- the controller: swings every rope, moves every rider ---- */
+class RopeSystem extends Entity {
+  constructor(ropes) {
+    super(0, 0, 1, 1);
+    this.solid = false;
+    this.ropes = ropes;
+    this.riders = new Map();   // Player -> { rope, d }
+    this.cooldown = new Map(); // Player -> seconds left
+    this.act = new Map();      // Player -> {down, upFor, rising} debounced E
+    this.hangTime = new Map(); // Player -> s spent on the current rope
+    this.lastGen = -1;
+    this.lastDriven = 0;
+  }
+
+  // Aliased below to every plausible per-tick hook name, because the
+  // engine's entity tick is not called `update` here (the debug readout
+  // proved it never fired). Whichever name World actually calls wins; if
+  // NONE of them are called, the rAF fallback at the bottom of this file
+  // drives it instead, host-side only.
+  // Fixed-step wrapper. Whatever dt arrives (sim frame or rAF), it gets
+  // consumed in 1/60 slices, so the pendulum integrates identically no
+  // matter the framerate. Without this the swing speed tracked the
+  // display refresh, which is what made it lurch a box at a time.
+  tickRope(dt) {
+    this.lastDriven = performance.now();
+    window.__ropeDriver = this._driver || 'engine';
+    if (!(dt > 0)) return;
+    this._acc = (this._acc || 0) + Math.min(dt, 0.1);
+    let guard = 0;
+    while (this._acc >= ROPE_STEP && guard++ < 8) {
+      this._acc -= ROPE_STEP;
+      this.stepRope(ROPE_STEP);
+    }
+    // riders are re-pinned every frame, not just on a fixed slice, so
+    // they never lag a frame behind the physics pass that just moved them
+    this.pinRiders();
+  }
+
+  stepRope(dt) {
+    const world = theWorld;
+    if (!world || !dt) return;
+    this._lastDt = dt;
+
+    // a level reset re-spawns everyone on the ledge — drop all riders
+    if (world.resetGeneration !== this.lastGen) {
+      this.lastGen = world.resetGeneration;
+      this.riders.clear();
+      this.cooldown.clear();
+      this.act.clear();
+      this.hangTime.clear();
+      for (const r of this.ropes) { r.theta = 0; r.omega = 0; r.latched = false; }
+    }
+
+    refreshInputs();
+
+    const players = world.entities.filter(e => e instanceof Player && !e.dead);
+
+    // ---- debounced ACTION edges, computed once per tick for everyone ----
+    // A brief gap in the input stream no longer counts as a release, so a
+    // press can't be double-read as grab-then-release.
+    for (const p of players) {
+      const raw = readInput(p).action;
+      let a = this.act.get(p);
+      if (!a) { a = { down: false, upFor: 99, rising: false }; this.act.set(p, a); }
+      a.rising = false;
+      if (raw) {
+        a.upFor = 0;
+        if (!a.down) { a.down = true; a.rising = true; }
+      } else {
+        a.upFor += dt;
+        if (a.upFor >= ACTION_DEBOUNCE) a.down = false;
+      }
+    }
+    for (const [p, v] of this.riders) {
+      this.hangTime.set(p, (this.hangTime.get(p) || 0) + dt);
+    }
+    if (ROPE_DEBUG) {
+      window.__ropeAction = players.filter(p => readInput(p).action).length + '/' + players.length;
+      window.__ropeRiders = this.riders.size;
+    }
+
+    for (const [p, t] of this.cooldown) {
+      const left = t - dt;
+      if (left <= 0) this.cooldown.delete(p); else this.cooldown.set(p, left);
+    }
+
+    // ---- catching ----
+    for (const p of players) {
+      if (this.riders.has(p) || this.cooldown.has(p)) continue;
+      // CONTROLS: ACTION (E) = grab, and press it again to let go.
+      //           JUMP   (W) = climb up, DOWN (S) = slide down.
+      // Grab fires on a debounced rising edge, so the press that grabs
+      // can never also be read as the press that releases.
+      const a = this.act.get(p);
+      if (!a || !a.rising) continue;
+      a.rising = false;              // consumed by the grab
+      const cx = p.x + p.w / 2, cy = p.y + p.h / 2;
+      let best = null, bestDist = GRAB_RADIUS;
+      for (const r of this.ropes) {
+        const pr = r.project(cx, cy);
+        if (pr.dist < bestDist) { bestDist = pr.dist; best = { r, d: pr.d }; }
+      }
+      if (best) this.attach(p, best.r, best.d);
+    }
+
+    // ---- swing each rope ----
+    for (const r of this.ropes) {
+      // Length tracks how many players are hanging on it. Riders slide
+      // down with the rope as it pays out (and are carried up as it
+      // retracts) so nobody's grip position jumps.
+      let onThisRope = 0;
+      for (const v of this.riders.values()) if (v.rope === r) onThisRope++;
+
+      // Starting length shrinks with team size: two players need a short
+      // stack, four need a tall one. Then it pays out per rider.
+      const heads = Math.max(2, players.length);
+      const start = Math.max(r.minLen,
+                             r.restLen - r.shrinkPerHead * (heads - 2));
+      let target = Math.min(r.maxLen, start + r.growPerRider * onThisRope);
+
+      // Everyone on at once? Latch, and never let it retract again.
+      if (onThisRope >= players.length && players.length > 0) r.latched = true;
+      if (r.latched) target = Math.max(target, r.len);
+      if (Math.abs(target - r.len) > 0.5) {
+        const before = r.len;
+        const dir = target > r.len ? 1 : -1;
+        r.len += dir * EXPAND_SPEED * dt;
+        if ((dir > 0 && r.len > target) || (dir < 0 && r.len < target)) r.len = target;
+        const scale = r.len / before;
+        for (const v of this.riders.values()) {
+          if (v.rope === r) v.d = Math.max(MIN_DIST, Math.min(r.len, v.d * scale));
+        }
+      }
+
+      let pump = 0, riderCount = 0;
+      for (const [p, v] of this.riders) {
+        if (v.rope !== r) continue;
+        riderCount++;
+        const inp = readInput(p);
+        if (inp.right) pump += 1;
+        if (inp.left)  pump -= 1;
+      }
+      if (riderCount > 0) pump /= riderCount;
+
+      const g = (PHYSICS && PHYSICS.GRAVITY) || 1700;
+      r.omega += (-(g / r.len) * Math.sin(r.theta) - ROPE_DAMPING * r.omega
+                  + pump * PUMP_ACCEL) * dt;
+      r.omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, r.omega));
+      r.theta += r.omega * dt;
+
+      // The tip is the only thing the client needs to see.
+      if (r.tip) {
+        const pt = r.pointAt(r.len);
+        r.tip.x = pt.x - TIP_SIZE / 2;
+        r.tip.y = pt.y - TIP_SIZE / 2;
+        r.tip.vx = 0; r.tip.vy = 0;
+      }
+
+    }
+
+  }
+
+  // Called every frame, AFTER the physics pass has run. Gravity has
+  // already moved the rider by then; this puts them back on the rope and
+  // cancels the velocity that would move them again next step. Doing this
+  // before physics instead is what made riders bob up and down.
+  pinRiders() {
+    const world = theWorld;
+    if (!world) return;
+    for (const [p, v] of [...this.riders]) {
+      const players = world.entities;
+      if (players.indexOf(p) === -1 || p.dead) { this.riders.delete(p); continue; }
+      const r = v.rope, inp = readInput(p);
+
+      // W (jump) climbs up, S slides down. Sliding stops at the tail —
+      // you drop off with E, not by sliding past the end.
+      if (inp.jump) v.d = Math.max(MIN_DIST, v.d - CLIMB_SPEED * this._lastDt);
+      if (ROPE_DEBUG) window.__ropeSliding = String(!!inp.down);
+      if (inp.down) v.d = v.d + SLIDE_SPEED * this._lastDt;
+      v.d = Math.max(MIN_DIST, Math.min(v.d, r.len));
+
+      // E pressed again lets go, carrying the swing velocity. Ignored for
+      // the first MIN_HANG_TIME so a laggy grab can't bounce straight off.
+      const a = this.act.get(p);
+      if (a && a.rising && (this.hangTime.get(p) || 0) >= MIN_HANG_TIME) {
+        a.rising = false;
+        this.release(p, v);
+        continue;
+      }
+
+      const pt = r.pointAt(v.d);
+      p.vx = 0; p.vy = 0;
+      p.x = pt.x - p.w / 2;
+      p.y = pt.y - p.h / 2;
+      p.grounded = false;
+      if (p.jumpBuffer !== undefined) p.jumpBuffer = 0;
+      p.facing = r.omega >= 0 ? 1 : -1;
+    }
+  }
+
+  attach(p, rope, d) {
+    // carry your momentum in: convert linear velocity to angular
+    const tx = Math.cos(rope.theta), ty = -Math.sin(rope.theta);
+    const tang = (p.vx || 0) * tx + (p.vy || 0) * ty;
+    const dd = Math.max(MIN_DIST, d);
+    const w = tang / dd;
+    rope.omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, rope.omega + w * 0.6));
+    this.riders.set(p, { rope, d: dd });
+    this.hangTime.set(p, 0);
+    p.vx = 0; p.vy = 0;
+  }
+
+  release(p, v) {
+    const r = v.rope;
+    const vx = r.omega * v.d * Math.cos(r.theta) * RELEASE_VX_MULT;
+    const vy = -r.omega * v.d * Math.sin(r.theta) - RELEASE_BOOST;
+    p.vx = vx; p.vy = vy;
+    this.riders.delete(p);
+    this.hangTime.delete(p);
+    this.cooldown.set(p, REGRAB_COOLDOWN);
+  }
+}
+
+// Whatever the engine calls, route it to tickRope. Harmless if the engine
+// calls more than one of these — tickRope is idempotent per dt.
+for (const name of ['update', 'step', 'tick', 'fixedUpdate', 'simulate', 'onTick']) {
+  if (!RopeSystem.prototype[name]) {
+    RopeSystem.prototype[name] = function (dt) { this.tickRope(dt); };
+  }
+}
+
+/* ---- rope sync ------------------------------------------------------
+   ONE tiny entity per rope — its tip — riding the ordinary snapshot path.
+   Three synced entities instead of the 21 coils this level started with:
+   the client draws from the pivot (which it already knows from the ROPES
+   config) to the synced tip, so the angle and length are implied and no
+   rope state has to be sent at all.
+
+   Deliberately NOT done over the level message channel: that would mean
+   reaching into Netcode.Client from level code, and sendLevelMsg is
+   unreliable and unordered, which is the wrong guarantee for something
+   redrawn every frame. Snapshots are self-healing by design. ---- */
+class RopeTip extends BouncingBall {
+  constructor(x, y) {
+    super(x, y, TIP_SIZE, TIP_SIZE, {
+      vx: 0, vy: 0, friction: 0, minSpeed: 0,
+      killsPlayers: false, bounds: null, color: ROPE_COLOR,
+    });
+    this.solid = false;
+    this.kind = 'ropetip';
+  }
+  update() { /* driven by RopeSystem */ }
+}
+
+/* =======================================================================
+   Level
+   ======================================================================= */
+const ropeObjs = ROPES.map((d, i) => new Rope(d, i));
 
 window.Level = {
-  // MUST be the real computed size. Hardcoding a smaller box (e.g. 1000)
-  // doesn't shrink the level — the geometry is still built out to
-  // LEVEL_W — it just makes the renderer and the camera bounds disagree
-  // with where things actually are, which is what cut the exit off the
-  // right-hand edge.
   WIDTH: LEVEL_W,
   HEIGHT: H_,
   VIEW_MODE: VIEW_MODE,
 
+  // stacked spawn — slot 0 on the ledge, each next slot on the one below,
+  // which is how the first player gets high enough to reach rope A.
   spawnPoint(slot) {
-    return { x: 40 + (slot % 4) * 30, y: FLOOR_Y - 40 - Math.floor(slot / 4) * 40 };
+    return { x: 60 + (slot % 2) * 34, y: LEDGE_Y - 40 - Math.floor(slot / 2) * 42 };
   },
 
   build(world, nw) {
-    world.deathY = H_ + 80;
-
-    // netcode.js's buildWorld() ALWAYS calls enableCamera(), and Camera
-    // defaults every edge to blocking — including the bottom. That bottom
-    // wall is solid, so a player falling into the chasm lands on it and
-    // never reaches deathY: no death, no reset, just standing in mid-air
-    // over the pit. engine.js flags this exact interaction in Camera's
-    // own comments and says to flip blockBottom off per-level when a
-    // level relies on falling to kill. This level does, so: off.
-    // Left/right stay on (they're the co-op screen-lock mechanic).
+    theWorld = world;
+    world.deathY = H_ + PIT_DEATH_PAD;
+    // falling into the pit must kill, so the camera's bottom wall can't
+    // be solid (same reasoning as Arrow Gap).
     world.cameraOpts = { blockBottom: false };
 
-    const start = new StaticBody(0, FLOOR_Y, START_W, 20);
-    start.color = PLATFORM_COLOR;
-    world.add(start);
+    // start ledge
+    const ledge = new StaticBody(0, LEDGE_Y, LEDGE_W, 24);
+    ledge.color = PLATFORM_COLOR;
+    world.add(ledge);
 
-    for (let i = 0; i < ARROW_COUNT; i++) {
-      const x = chasmStartX + GAP_MARGIN + i * ARROW_GAP;
-      const dir = (i % 2 === 0) ? 1 : -1;
-      const spawner = new ProjectileSpawner(x, 20, {
-        vx: dir * ARROW_SPEED,
-        vy: ARROW_SPEED * (40 / 70),
-        gravity: null,        // world default gravity -> natural arc
-        // 'onLand' rather than the default 'bounds': with 'bounds' an
-        // arrow that hits a stone (or a player) freezes in place and
-        // hangs there until it leaves the level, which is why spent
-        // arrows were piling up on screen. 'onLand' despawns them the
-        // moment they connect — engine.js's projectile pass only
-        // despawns-on-kill for this rule.
-        despawn: 'onLand',
-        interval: 1.6,
-        phase: (i % 2) * 0.8,
-        // MUST match netcode.js TYPE_REGISTRY's projectile makeLocal
-        // (w:8, h:20) — the client materializes projectiles from that
-        // placeholder, not from anything sent over the wire, so a
-        // different size here would render correctly on the host and
-        // wrong on every client.
-        w: 8, h: 20,
-        color: '#e8d5a0',
-        kind: 'arrow',
-      });
-      world.add(spawner);
-      nw.spawners.push(spawner);
+    // Small anchor block per rope. Built in rope order so host and client
+    // still produce identical static ids. (The old full-width beam also
+    // acted as a lid stopping you launching over the puzzle — that job is
+    // now the camera's top wall.)
+    if (ANCHOR_STYLE === 'block') {
+      for (const def of ROPES) {
+        const a = new StaticBody(def.x - ANCHOR_W / 2, CEILING_Y - ANCHOR_H,
+                                 ANCHOR_W, ANCHOR_H);
+        a.color = '#3d3d52';
+        if (!ANCHOR_SOLID) a.solid = false;
+        world.add(a);
+      }
     }
 
-    const safe = new StaticBody(chasmEndX, FLOOR_Y, safeSpaceW, 20);
-    safe.color = PLATFORM_COLOR;
-    world.add(safe);
+    // exit platform + goal
+    const plat = new StaticBody(EXIT_X, EXIT_PLAT_Y, EXIT_PLAT_W, 22);
+    plat.color = PLATFORM_COLOR;
+    world.add(plat);
 
-    // Stepping stones inside the chasm — the crossing the arrows are
-    // meant to threaten. Without these the gap was 230px against a 171px
-    // maximum jump, so nobody ever got close enough to be hit.
-    for (const sx of stoneXs) {
-      const stone = new StaticBody(sx, FLOOR_Y, STONE_W, 16);
-      stone.color = '#b272f2';
-      world.add(stone);
-    }
-
-    const step1 = new StaticBody(step1X, FLOOR_Y - 60, stepW, 16);
-    step1.color = PLATFORM_COLOR;
-    world.add(step1);
-    const step2 = new StaticBody(step2X, FLOOR_Y - 60, step2W, 16);
-    step2.color = PLATFORM_COLOR;
-    world.add(step2);
-
-    // Orb 1 — decorative. solid:false and it never moves, so it needs no
-    // nw array and costs no bandwidth; it just renders.
-    const orb1 = new Entity(step1X + stepW / 2 - ORB_R, FLOOR_Y - 60 - ORB_HOVER - ORB_R,
-                            ORB_R * 2, ORB_R * 2);
-    orb1.solid = false;
-    orb1.kind = 'orb';
-    orb1.color = '#8f8fc8';
-    world.add(orb1);
-
-    // Orb 2 — lethal. The kill is a TriggerZone (effect:'kill'), the only
-    // static kill primitive that's reliably synced: it goes in
-    // nw.triggers and its position never moves, so host and clients agree
-    // for free. Killing a player ticks world.resetGeneration, which is
-    // the same path an arrow hit already uses — so touching this restarts
-    // the level with no extra netcode.
-    const orb2X = step2X + step2W * DEATH_ORB_T - ORB_R;
-    const orb2Y = FLOOR_Y - 60 - ORB_HOVER - ORB_R;
-    const deathOrb = new TriggerZone(orb2X, orb2Y, ORB_R * 2, ORB_R * 2,
-                                     { effect: 'kill', kind: 'death-orb' });
-    deathOrb.color = '#d94f4f';
-    world.add(deathOrb);
-    nw.triggers.push(deathOrb);
-
-    const pedestal = new StaticBody(exitX, FLOOR_Y - 60, exitPedestalW, 16);
-    pedestal.color = PLATFORM_COLOR;
-    world.add(pedestal);
-
-    const goal = new TriggerZone(exitX + 10, FLOOR_Y - 110, 80, 50, { effect: 'goal', kind: 'exit' });
+    const goal = new TriggerZone(EXIT_X + EXIT_PLAT_W - 100, EXIT_PLAT_Y - 60, 80, 60,
+                                 { effect: 'goal', kind: 'exit' });
     goal.color = GOAL_COLOR;
-    world.add(goal); nw.triggers.push(goal);
-    // 'each': a player touching the exit goes through it and is removed
-    // from the room; the level completes once everyone has been through.
-    nw.winCondition = { type: 'reach-goal', mode: 'each', goals: [goal] };
+    world.add(goal);
+    nw.triggers.push(goal);
 
+    // No rope entities at all now — the shape is derived from `theta` and
+    // `len`, which the host broadcasts a few times a second.
+    for (const r of ropeObjs) {
+      r.len = ROPES[r.index].restLen;
+      r.latched = false;
+      r.theta = 0; r.omega = 0;
+      const pt = r.pointAt(r.len);
+      r.tip = new RopeTip(pt.x - TIP_SIZE / 2, pt.y - TIP_SIZE / 2);
+      world.add(r.tip);
+    }
+
+    // controller last — static build order above it is unchanged, so host
+    // and client still agree on every static entity id.
+    ropeSystem = new RopeSystem(ropeObjs);
+    world.add(ropeSystem);
+
+    // Drive the rope from the world's own step, so it runs on the fixed
+    // sim timestep and — crucially — AFTER the physics pass, which is
+    // what stops riders bobbing. Wrapping the instance method leaves
+    // engine.js untouched. If the engine's tick is named something else,
+    // the aliases and the rAF fallback still cover it.
+    for (const name of ['step', 'update', 'tick']) {
+      if (typeof world[name] === 'function' && !world['__ropeWrapped_' + name]) {
+        const orig = world[name].bind(world);
+        world['__ropeWrapped_' + name] = true;
+        world[name] = function (dt) {
+          const out = orig(dt);
+          try { ropeSystem._driver = 'world.' + name; ropeSystem.tickRope(dt); }
+          catch (e) {}
+          return out;
+        };
+        break;
+      }
+    }
+
+    nw.winCondition = { type: 'reach-goal', mode: 'each', goals: [goal] };
   },
 };
 
+/* ---- rope line art, pinned to the interpolated coil positions so it
+        looks identical on host and clients. ---- */
+window.LevelDraw = function (ctx, list, t) {
+  // Match each rope's tip by nearest pivot rather than by identity — the
+  // client's tips are makeLocal copies of the host's.
+  const tips = [];
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i], e = it.entity;
+    if (!e) continue;
+    const isTip = e.kind === 'ropetip' ||
+                  (e.isBouncingBall && e.w <= TIP_SIZE + 2 && e.h <= TIP_SIZE + 2);
+    if (!isTip) continue;
+    tips.push({ x: it.x + (e.w || TIP_SIZE) / 2, y: it.y + (e.h || TIP_SIZE) / 2 });
+  }
+  if (ROPE_DEBUG) window.__ropeTips = tips.length;
+
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (let ri = 0; ri < ROPES.length; ri++) {
+    const px = ROPES[ri].x, py = CEILING_Y;
+    let tip = null, bestD = Infinity;
+    for (const c of tips) {
+      const d = Math.hypot(c.x - px, c.y - py) + Math.abs(c.x - px) * 0.5;
+      if (d < bestD) { bestD = d; tip = c; }
+    }
+    if (!tip) continue;
+
+    const path = [];
+    for (let k = 0; k <= ROPE_SEGMENTS; k++) {
+      const f = k / ROPE_SEGMENTS;
+      path.push({ x: px + (tip.x - px) * f, y: py + (tip.y - py) * f });
+    }
+    const trace = () => {
+      ctx.beginPath();
+      ctx.moveTo(path[0].x, path[0].y);
+      for (let k = 1; k < path.length; k++) ctx.lineTo(path[k].x, path[k].y);
+    };
+    trace(); ctx.strokeStyle = 'rgba(0,0,0,0.40)';        ctx.lineWidth = 7;   ctx.stroke();
+    trace(); ctx.strokeStyle = ROPE_COLOR;                ctx.lineWidth = 4;   ctx.stroke();
+    trace(); ctx.strokeStyle = 'rgba(255,235,200,0.30)';  ctx.lineWidth = 1.5; ctx.stroke();
+
+    ctx.fillStyle = '#8a6a3d';
+    ctx.beginPath();
+    ctx.arc(px, py, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // --- debug readout: which input field was found, and who's holding
+  //     ACTION right now. Delete this block once grabbing works. ---
+  if (ROPE_DEBUG) {
+    ctx.font = '12px ui-monospace, monospace';
+    ctx.fillStyle = window.__ropeInput === 'NOT FOUND' ? '#ff8a8a' : '#8affa0';
+    ctx.fillText('input src: ' + (window.__ropeInput || '(waiting)'), 12, CEILING_Y + 26);
+    ctx.fillStyle = '#c8c8d8';
+    ctx.fillText('action held: ' + (window.__ropeAction || '-'), 12, CEILING_Y + 42);
+    ctx.fillText('riders: ' + (window.__ropeRiders || 0), 12, CEILING_Y + 58);
+    ctx.fillStyle = window.__ropeDriver ? '#8affa0' : '#ff8a8a';
+    ctx.fillText('driver: ' + (window.__ropeDriver || 'NOTHING TICKING'), 12, CEILING_Y + 74);
+    ctx.fillStyle = '#c8c8d8';
+    ctx.fillText('local input: ' + (window.__ropeLoc || '-'), 12, CEILING_Y + 90);
+    ctx.fillStyle = '#ffd18a';
+    ctx.fillText('raw mask: ' + (window.__ropeMask || '-') + '   (DOWN = bit 16)',
+                 12, CEILING_Y + 106);
+    ctx.fillText('local .down: ' + (window.__ropeLocDown || '-'), 12, CEILING_Y + 122);
+    ctx.fillText('slide now: ' + (window.__ropeSliding || '-'), 12, CEILING_Y + 138);
+    ctx.fillStyle = '#c8c8d8';
+    ctx.fillText('rope tips: ' + (window.__ropeTips || 0) + ' / ' + ROPES.length,
+                 12, CEILING_Y + 154);
+    if (window.__ropeErr) {
+      ctx.fillStyle = '#ff8a8a';
+      ctx.fillText('level err: ' + window.__ropeErr, 12, CEILING_Y + 186);
+    }
+  }
+  ctx.restore();
+};
+
+/* ---- host-side rAF fallback ------------------------------------------
+   If the engine never calls any of the tick aliases above, nothing moves
+   and nothing can be grabbed. This drives the rope system directly from
+   the render loop instead, at a clamped fixed-ish dt.
+
+   It only runs on the host: Host.nw exists and holds the live world only
+   on the simulating peer, so clients never enter this and their rope
+   positions keep coming from snapshots as normal. It also stands down the
+   moment the engine proves it IS calling us. */
+(function ropeFallback() {
+  let last = performance.now();
+  function loop() {
+    requestAnimationFrame(loop);
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (!theWorld || !ropeSystem) return;
+
+    const H = window.Netcode && window.Netcode.Host;
+    const isHost = !!(H && H.nw && typeof H.tick === 'number');
+    if (!isHost) return;
+
+    // engine is driving it — leave it alone
+    if (now - ropeSystem.lastDriven < 250) return;
+    ropeSystem._driver = 'raf';
+    ropeSystem.tickRope(dt);
+  }
+  requestAnimationFrame(loop);
+})();
+
+} catch (__levelErr) {
+  // A crash in level code must never take the page down with it — the
+  // lobby handoff and the join flow have to survive a broken level.
+  window.__ropeErr = 'level script: ' + (__levelErr && __levelErr.message || __levelErr);
+  console.error('[level-rope] level script failed:', __levelErr);
+}
 })();
 </script>
 
@@ -584,10 +1135,14 @@ const ctx = canvas.getContext('2d');
 const setStatus = m => { bootStatus.textContent = m; };
 
 const input = new window.InputManager();
+// Exposed for level code: netcode keeps REMOTE input in its per-slot
+// records, but the local player's live buttons only ever live here.
+window.__gameInput = input;
 window.bindTouchButton($('btnLeft'),   input, 'left');
 window.bindTouchButton($('btnRight'),  input, 'right');
 window.bindTouchButton($('btnJump'),   input, 'jump');
 window.bindTouchButton($('btnAction'), input, 'action');
+window.bindTouchButton($('btnDown'),   input, 'down');
 
 let side = null, peer = null, running = false, myPeerId = null;
 
@@ -826,6 +1381,12 @@ function draw() {
 
   const list = side.renderList();
 
+  // Level-owned art, inside the world transform and behind entities.
+  if (typeof window.LevelDraw === 'function') {
+    try { window.LevelDraw(ctx, list, t); }
+    catch (err) { console.warn('LevelDraw threw:', err); }
+  }
+
   for (let i = 0; i < list.length; i++) {
     const e = list[i].entity;
     if (!e.isWindZone) continue;
@@ -840,6 +1401,9 @@ function draw() {
     // (engine.js sets isCameraWall on them) — drawing them is what put
     // those stray rectangles on screen.
     if (e.isCameraWall) continue;
+    // rope tips are invisible carriers; LevelDraw draws the rope itself
+    if (e.kind === 'ropetip') continue;
+    if (e.isBouncingBall && e.w <= 8 && e.h <= 8) continue;
     const x = it.x, y = it.y;
 
     if (e instanceof Player) {
