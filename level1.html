@@ -363,6 +363,7 @@
 <script>
 (function () {
 "use strict";
+try {
 
 const { StaticBody, Entity, TriggerZone, BouncingBall, Player, PHYSICS } = window.Engine;
 
@@ -878,51 +879,47 @@ const clientRopes = ROPES.map(d => ({ theta: 0, omega: 0, len: d.restLen }));
 let clientLastFrame = 0;
 
 (function wireRopeSync() {
-  // The shell assigns Client.onLevelMsg during boot, which can land after
-  // this script runs and quietly replace our handler — that's why the
-  // client never saw a rope message. So we install, then keep checking
-  // that we're still installed, chaining to whatever else was set.
-  let ours = null;
-  function install() {
-    const N = window.Netcode;
-    if (!N || !N.Client) return;
-    if (N.Client.onLevelMsg === ours) return;
-    const prev = typeof N.Client.onLevelMsg === 'function'
-      ? N.Client.onLevelMsg.bind(N.Client) : null;
-    ours = function (payload) {
-      try {
-        if (payload && payload.t === 'rope' && Array.isArray(payload.a)) {
-          for (let i = 0; i < payload.a.length && i < clientRopes.length; i++) {
-            const m = payload.a[i];
-            const c = clientRopes[i];
-            c.theta += (m[0] - c.theta) * ROPE_BLEND;
-            c.omega += (m[1] - c.omega) * ROPE_BLEND;
-            c.len = m[2];
-          }
-          window.__ropeSync = (window.__ropeSync || 0) + 1;
-        }
-      } catch (e) {}
-      if (prev) return prev(payload);
-    };
-    N.Client.onLevelMsg = ours;
-  }
-  install();
-  setInterval(install, 1000);
+  // Installed defensively: netcode.js loads AFTER this script (script order
+  // is engine -> input -> level -> netcode), so Netcode is undefined right
+  // now. We retry a bounded number of times rather than holding a forever
+  // interval that re-wraps the handler chain every second.
+  let ours = null, tries = 0, timer = null;
 
-  // If nothing has arrived after a few seconds, say so loudly and dump
-  // what the Client object actually offers — the handler name is the only
-  // thing that can be wrong at that point.
-  setTimeout(function () {
-    const N = window.Netcode;
-    const isClient = !(N && N.Host && N.Host.nw);
-    if (isClient && !window.__ropeSync) {
-      try {
-        console.warn('[rope] no rope messages received. Client keys:',
-          Object.keys(N.Client).join(','),
-          '| proto:', Object.getOwnPropertyNames(Object.getPrototypeOf(N.Client) || {}).join(','));
-      } catch (e) {}
+  function install() {
+    try {
+      const N = window.Netcode;
+      if (!N || !N.Client) return false;
+      if (N.Client.onLevelMsg === ours) return true;
+      const prev = (typeof N.Client.onLevelMsg === 'function' && N.Client.onLevelMsg !== ours)
+        ? N.Client.onLevelMsg.bind(N.Client) : null;
+      ours = function (payload) {
+        try {
+          if (payload && payload.t === 'rope' && Array.isArray(payload.a)) {
+            for (let i = 0; i < payload.a.length && i < clientRopes.length; i++) {
+              const m = payload.a[i];
+              const c = clientRopes[i];
+              c.theta += (m[0] - c.theta) * ROPE_BLEND;
+              c.omega += (m[1] - c.omega) * ROPE_BLEND;
+              c.len = m[2];
+            }
+            window.__ropeSync = (window.__ropeSync || 0) + 1;
+          }
+        } catch (e) {}
+        if (prev) { try { return prev(payload); } catch (e) {} }
+      };
+      N.Client.onLevelMsg = ours;
+      return true;
+    } catch (e) {
+      window.__ropeErr = 'install: ' + (e && e.message || e);
+      return false;
     }
-  }, 5000);
+  }
+
+  timer = setInterval(function () {
+    // keep trying until netcode exists and we're installed, then stop —
+    // but re-check a few times in case boot replaces the handler later
+    if (install() && ++tries > 12) clearInterval(timer);
+  }, 500);
 })();
 
 function advanceClientRopes(dt) {
@@ -1091,6 +1088,10 @@ window.LevelDraw = function (ctx, list, t) {
     ctx.fillStyle = '#c8c8d8';
     ctx.fillText('rope tx: ' + (window.__ropeTx || 0) +
                  '   rx: ' + (window.__ropeSync || 0), 12, CEILING_Y + 154);
+    if (window.__ropeErr) {
+      ctx.fillStyle = '#ff8a8a';
+      ctx.fillText('level err: ' + window.__ropeErr, 12, CEILING_Y + 186);
+    }
     if (window.__ropeTxErr) {
       ctx.fillStyle = '#ff8a8a';
       ctx.fillText('tx error: ' + window.__ropeTxErr, 12, CEILING_Y + 170);
@@ -1129,6 +1130,12 @@ window.LevelDraw = function (ctx, list, t) {
   requestAnimationFrame(loop);
 })();
 
+} catch (__levelErr) {
+  // A crash in level code must not take the page down with it — that is
+  // what stopped the lobby/join screen from working.
+  window.__ropeErr = 'level script: ' + (__levelErr && __levelErr.message || __levelErr);
+  console.error('[level-rope] level script failed:', __levelErr);
+}
 })();
 </script>
 
