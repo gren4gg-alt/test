@@ -444,8 +444,7 @@ const RELEASE_VX_MULT = 1.15;  // multiplier on the swing velocity you keep
 // A rope is a straight segment, so the client only needs its angle and
 // length: 3 ropes x 3 numbers, sent at ROPE_SYNC_HZ over the level message
 // channel, and integrated locally in between.
-const ROPE_SYNC_HZ   = 15;     // rope state broadcasts per second
-const ROPE_BLEND     = 0.35;   // how hard a client snaps to host state (0-1)
+const TIP_SIZE       = 6;      // the one synced entity per rope
 const ROPE_SEGMENTS  = 8;      // curve smoothness, purely local — free
 const ROPE_COLOR     = '#c9a36b';
 const PLATFORM_COLOR = '#a778d6';
@@ -797,6 +796,14 @@ class RopeSystem extends Entity {
       r.omega = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, r.omega));
       r.theta += r.omega * dt;
 
+      // The tip is the only thing the client needs to see.
+      if (r.tip) {
+        const pt = r.pointAt(r.len);
+        r.tip.x = pt.x - TIP_SIZE / 2;
+        r.tip.y = pt.y - TIP_SIZE / 2;
+        r.tip.vx = 0; r.tip.vy = 0;
+      }
+
     }
 
   }
@@ -870,65 +877,23 @@ for (const name of ['update', 'step', 'tick', 'fixedUpdate', 'simulate', 'onTick
   }
 }
 
-/* ---- client-side rope playback -------------------------------------
-   Clients get {theta, omega, len} a few times a second and integrate the
-   same pendulum in between, blending toward the host's values as they
-   arrive. That keeps the swing smooth at any snapshot rate without
-   putting a single rope entity on the wire. ---- */
-const clientRopes = ROPES.map(d => ({ theta: 0, omega: 0, len: d.restLen }));
-let clientLastFrame = 0;
-
-(function wireRopeSync() {
-  // Installed defensively: netcode.js loads AFTER this script (script order
-  // is engine -> input -> level -> netcode), so Netcode is undefined right
-  // now. We retry a bounded number of times rather than holding a forever
-  // interval that re-wraps the handler chain every second.
-  let ours = null, tries = 0, timer = null;
-
-  function install() {
-    try {
-      const N = window.Netcode;
-      if (!N || !N.Client) return false;
-      if (N.Client.onLevelMsg === ours) return true;
-      const prev = (typeof N.Client.onLevelMsg === 'function' && N.Client.onLevelMsg !== ours)
-        ? N.Client.onLevelMsg.bind(N.Client) : null;
-      ours = function (payload) {
-        try {
-          if (payload && payload.t === 'rope' && Array.isArray(payload.a)) {
-            for (let i = 0; i < payload.a.length && i < clientRopes.length; i++) {
-              const m = payload.a[i];
-              const c = clientRopes[i];
-              c.theta += (m[0] - c.theta) * ROPE_BLEND;
-              c.omega += (m[1] - c.omega) * ROPE_BLEND;
-              c.len = m[2];
-            }
-            window.__ropeSync = (window.__ropeSync || 0) + 1;
-          }
-        } catch (e) {}
-        if (prev) { try { return prev(payload); } catch (e) {} }
-      };
-      N.Client.onLevelMsg = ours;
-      return true;
-    } catch (e) {
-      window.__ropeErr = 'install: ' + (e && e.message || e);
-      return false;
-    }
+/* ---- rope sync ------------------------------------------------------
+   ONE tiny entity per rope — its tip — synced through the ordinary
+   snapshot path. That's 3 entities instead of the 21 coils this started
+   with, and nothing touches Netcode.Client, which is what stopped the
+   join flow from working. The client draws from the pivot (known from the
+   ROPES config) to the synced tip, so angle and length come for free and
+   no rope state has to be sent at all. ---- */
+class RopeTip extends BouncingBall {
+  constructor(x, y) {
+    super(x, y, TIP_SIZE, TIP_SIZE, {
+      vx: 0, vy: 0, friction: 0, minSpeed: 0,
+      killsPlayers: false, bounds: null, color: ROPE_COLOR,
+    });
+    this.solid = false;
+    this.kind = 'ropetip';
   }
-
-  timer = setInterval(function () {
-    // keep trying until netcode exists and we're installed, then stop —
-    // but re-check a few times in case boot replaces the handler later
-    if (install() && ++tries > 12) clearInterval(timer);
-  }, 500);
-})();
-
-function advanceClientRopes(dt) {
-  const g = (PHYSICS && PHYSICS.GRAVITY) || 1700;
-  for (const c of clientRopes) {
-    if (!(c.len > 0)) continue;
-    c.omega += (-(g / c.len) * Math.sin(c.theta) - ROPE_DAMPING * c.omega) * dt;
-    c.theta += c.omega * dt;
-  }
+  update() { /* driven by RopeSystem */ }
 }
 
 /* =======================================================================
@@ -990,6 +955,9 @@ window.Level = {
       r.len = ROPES[r.index].restLen;
       r.latched = false;
       r.theta = 0; r.omega = 0;
+      const pt = r.pointAt(r.len);
+      r.tip = new RopeTip(pt.x - TIP_SIZE / 2, pt.y - TIP_SIZE / 2);
+      world.add(r.tip);
     }
 
     // controller last — static build order above it is unchanged, so host
@@ -1023,40 +991,41 @@ window.Level = {
 /* ---- rope line art, pinned to the interpolated coil positions so it
         looks identical on host and clients. ---- */
 window.LevelDraw = function (ctx, list, t) {
-  // Nothing is looked up in the draw list any more. The host draws from
-  // its live rope objects; a client draws from the state it was sent,
-  // advanced locally between messages.
-  const now = performance.now();
-  const dt = clientLastFrame ? Math.min(0.05, (now - clientLastFrame) / 1000) : 0;
-  clientLastFrame = now;
-
-  const H = window.Netcode && window.Netcode.Host;
-  const isHost = !!(H && H.nw);
-  if (!isHost) advanceClientRopes(dt);
+  // Match each rope's tip by nearest pivot rather than by identity — the
+  // client's tips are makeLocal copies of the host's.
+  const tips = [];
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i], e = it.entity;
+    if (!e) continue;
+    const isTip = e.kind === 'ropetip' ||
+                  (e.isBouncingBall && e.w <= TIP_SIZE + 2 && e.h <= TIP_SIZE + 2);
+    if (!isTip) continue;
+    tips.push({ x: it.x + (e.w || TIP_SIZE) / 2, y: it.y + (e.h || TIP_SIZE) / 2 });
+  }
+  if (ROPE_DEBUG) window.__ropeTips = tips.length;
 
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   for (let ri = 0; ri < ROPES.length; ri++) {
-    const src = isHost ? ropeObjs[ri] : clientRopes[ri];
-    if (!src || !(src.len > 0)) continue;
     const px = ROPES[ri].x, py = CEILING_Y;
-    const sin = Math.sin(src.theta), cos = Math.cos(src.theta);
+    let tip = null, bestD = Infinity;
+    for (const c of tips) {
+      const d = Math.hypot(c.x - px, c.y - py) + Math.abs(c.x - px) * 0.5;
+      if (d < bestD) { bestD = d; tip = c; }
+    }
+    if (!tip) continue;
 
-    // A straight segment, drawn as several points so a future sag or
-    // wobble can be added without touching anything else.
     const path = [];
     for (let k = 0; k <= ROPE_SEGMENTS; k++) {
-      const d = src.len * (k / ROPE_SEGMENTS);
-      path.push({ x: px + sin * d, y: py + cos * d });
+      const f = k / ROPE_SEGMENTS;
+      path.push({ x: px + (tip.x - px) * f, y: py + (tip.y - py) * f });
     }
-
     const trace = () => {
       ctx.beginPath();
       ctx.moveTo(path[0].x, path[0].y);
       for (let k = 1; k < path.length; k++) ctx.lineTo(path[k].x, path[k].y);
     };
-
     trace(); ctx.strokeStyle = 'rgba(0,0,0,0.40)';        ctx.lineWidth = 7;   ctx.stroke();
     trace(); ctx.strokeStyle = ROPE_COLOR;                ctx.lineWidth = 4;   ctx.stroke();
     trace(); ctx.strokeStyle = 'rgba(255,235,200,0.30)';  ctx.lineWidth = 1.5; ctx.stroke();
@@ -1086,15 +1055,11 @@ window.LevelDraw = function (ctx, list, t) {
     ctx.fillText('local .down: ' + (window.__ropeLocDown || '-'), 12, CEILING_Y + 122);
     ctx.fillText('slide now: ' + (window.__ropeSliding || '-'), 12, CEILING_Y + 138);
     ctx.fillStyle = '#c8c8d8';
-    ctx.fillText('rope tx: ' + (window.__ropeTx || 0) +
-                 '   rx: ' + (window.__ropeSync || 0), 12, CEILING_Y + 154);
+    ctx.fillText('rope tips: ' + (window.__ropeTips || 0) + ' / ' + ROPES.length,
+                 12, CEILING_Y + 154);
     if (window.__ropeErr) {
       ctx.fillStyle = '#ff8a8a';
       ctx.fillText('level err: ' + window.__ropeErr, 12, CEILING_Y + 186);
-    }
-    if (window.__ropeTxErr) {
-      ctx.fillStyle = '#ff8a8a';
-      ctx.fillText('tx error: ' + window.__ropeTxErr, 12, CEILING_Y + 170);
     }
   }
   ctx.restore();
@@ -1131,8 +1096,7 @@ window.LevelDraw = function (ctx, list, t) {
 })();
 
 } catch (__levelErr) {
-  // A crash in level code must not take the page down with it — that is
-  // what stopped the lobby/join screen from working.
+  // A crash in level code must never take the page down with it.
   window.__ropeErr = 'level script: ' + (__levelErr && __levelErr.message || __levelErr);
   console.error('[level-rope] level script failed:', __levelErr);
 }
@@ -1428,6 +1392,9 @@ function draw() {
     // (engine.js sets isCameraWall on them) — drawing them is what put
     // those stray rectangles on screen.
     if (e.isCameraWall) continue;
+    // rope tips are invisible carriers; LevelDraw draws the rope itself
+    if (e.kind === 'ropetip') continue;
+    if (e.isBouncingBall && e.w <= 8 && e.h <= 8) continue;
     const x = it.x, y = it.y;
 
     if (e instanceof Player) {
